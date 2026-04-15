@@ -141,8 +141,8 @@ def main():
             resp_pm = requests.get(f"https://clob.polymarket.com/book?token_id={token_yes}", proxies=proxies, headers=headers, timeout=5)
             book_pm = resp_pm.json()
             bids_pm, asks_pm = pd.DataFrame(book_pm.get('bids', [])), pd.DataFrame(book_pm.get('asks', []))
-            v_b_pm = bids_pm['size'].astype(float).sum() if not bids_pm.empty else 0
-            v_a_pm = asks_pm['size'].astype(float).sum() if not asks_pm.empty else 0
+            v_b_pm = bids_pm.head(5)['size'].astype(float).sum() if not bids_pm.empty else 0
+            v_a_pm = asks_pm.head(5)['size'].astype(float).sum() if not asks_pm.empty else 0
             obi_pm = calculate_obi(pd.DataFrame({"bid_size": [v_b_pm], "ask_size": [v_a_pm]})) if (v_b_pm + v_a_pm) > 0 else 0
 
             obi_trad_raw = get_binance_obi(symbol=ticker)
