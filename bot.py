@@ -172,7 +172,7 @@ def main():
                 # TERMINAL ALERT IF THRESHOLD IS BREACHED
                 if abs(z_score) > z_threshold:
                     direction = "BUY (PM Underpriced)" if z_score > 0 else "SELL (PM Overpriced)"
-                    print(f"\n🚨 TRIGGER! Z-Score: {z_score:.2f} | {direction} | Spread: {divergence:.4f}")
+                    print(f"\n TRIGGER! Z-Score: {z_score:.2f} | {direction} | Spread: {divergence:.4f}")
 
             db_cursor.execute("INSERT INTO spread_log (ticker, binance_obi_raw, binance_ema, polymarket_obi, spread, z_score) VALUES (?, ?, ?, ?, ?, ?)", (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score))
             db_conn.commit()
