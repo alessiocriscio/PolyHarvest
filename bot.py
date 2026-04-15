@@ -8,6 +8,7 @@ import atexit
 import os
 import re
 import sqlite3
+import numpy as np
 from obi_engine import calculate_obi
 
 tor_process = None
@@ -45,16 +46,19 @@ def start_tor():
 
 def get_binance_obi(symbol):
     if '_' in symbol:
-        url = f"https://dapi.binance.com/dapi/v1/depth?symbol={symbol}&limit=100"
+        url = f"https://dapi.binance.com/dapi/v1/depth?symbol={symbol}&limit=10"
     else:
-        url = f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=100"
+        url = f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=10"
     try:
         resp = requests.get(url, timeout=3)
         data = resp.json()
         bids = pd.DataFrame(data.get('bids', []), columns=['price', 'bid_size']).astype(float)
         asks = pd.DataFrame(data.get('asks', []), columns=['price', 'ask_size']).astype(float)
-        vol_bids = bids['bid_size'].sum() if not bids.empty else 0
-        vol_asks = asks['ask_size'].sum() if not asks.empty else 0
+        
+        # SYMMETRIC EXTRACTION: Cut to the top 5 levels of real liquidity
+        vol_bids = bids.head(5)['bid_size'].sum() if not bids.empty else 0
+        vol_asks = asks.head(5)['ask_size'].sum() if not asks.empty else 0
+        
         df = pd.DataFrame({"bid_size": [vol_bids], "ask_size": [vol_asks]})
         return calculate_obi(df) if (vol_bids + vol_asks) > 0 else 0
     except Exception:
@@ -89,7 +93,7 @@ def main():
     url = input("\nEnter Polymarket URL: ").strip()
     ticker = input("Enter Binance Ticker (e.g., BTCUSDT): ").strip().upper()
     try:
-        z_threshold = float(input("Enter Z-Score threshold for alerts: "))
+        z_threshold = float(input("Enter Z-Score threshold for alerts (e.g., 2.0): "))
     except ValueError:
         z_threshold = 2.0
 
@@ -122,7 +126,7 @@ def main():
                 min_distance, best_idx = abs(strike - current_spot_price), i
 
         if not market_list:
-            print("[ERROR] Nessun mercato attivo trovato.")
+            print("[ERROR] No active market found.")
             return
 
         question, token_yes = market_list[best_idx]
@@ -141,6 +145,8 @@ def main():
             resp_pm = requests.get(f"https://clob.polymarket.com/book?token_id={token_yes}", proxies=proxies, headers=headers, timeout=5)
             book_pm = resp_pm.json()
             bids_pm, asks_pm = pd.DataFrame(book_pm.get('bids', [])), pd.DataFrame(book_pm.get('asks', []))
+            
+            # SYMMETRIC EXTRACTION: Cut to the top 5 levels for Polymarket too
             v_b_pm = bids_pm.head(5)['size'].astype(float).sum() if not bids_pm.empty else 0
             v_a_pm = asks_pm.head(5)['size'].astype(float).sum() if not asks_pm.empty else 0
             obi_pm = calculate_obi(pd.DataFrame({"bid_size": [v_b_pm], "ask_size": [v_a_pm]})) if (v_b_pm + v_a_pm) > 0 else 0
@@ -148,15 +154,25 @@ def main():
             obi_trad_raw = get_binance_obi(symbol=ticker)
             ema_binance = obi_trad_raw if ema_binance is None else (obi_trad_raw * alpha) + (ema_binance * (1 - alpha))
 
-            divergence = abs(ema_binance - obi_pm)
+            # DIRECTIONAL SPREAD: No abs() to maintain signal direction
+            divergence = ema_binance - obi_pm
+            
+            # ROLLING WINDOW: 80 samples
             spread_history.append(divergence)
-            if len(spread_history) > 20: spread_history.pop(0)
+            if len(spread_history) > 80: 
+                spread_history.pop(0)
 
             z_score = 0
-            if len(spread_history) == 20:
+            if len(spread_history) == 80:
                 s_series = pd.Series(spread_history)
                 mean, std = s_series.mean(), s_series.std()
-                if std > 0: z_score = (divergence - mean) / std
+                if std > 0: 
+                    z_score = (divergence - mean) / std
+                
+                # TERMINAL ALERT IF THRESHOLD IS BREACHED
+                if abs(z_score) > z_threshold:
+                    direction = "BUY (PM Underpriced)" if z_score > 0 else "SELL (PM Overpriced)"
+                    print(f"\n🚨 TRIGGER! Z-Score: {z_score:.2f} | {direction} | Spread: {divergence:.4f}")
 
             db_cursor.execute("INSERT INTO spread_log (ticker, binance_obi_raw, binance_ema, polymarket_obi, spread, z_score) VALUES (?, ?, ?, ?, ?, ?)", (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score))
             db_conn.commit()
