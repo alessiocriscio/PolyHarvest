@@ -1,4 +1,5 @@
-RELAZIONE TECNICA: INFRASTRUTTURA DI ARBITRAGGIO STATISTICO (BINANCE VS POLYMARKET)
+RELAZIONE TECNICA: INFRASTRUTTURA DI ARBITRAGGIO STATISTICO (BINANCE VS POLYMARKET) 
+By Alessio Criscio
 
 1. OVERVIEW DEL SISTEMA
 L'obiettivo del progetto è sfruttare le inefficienze microstrutturali tra un exchange centralizzato ad alta frequenza (Binance) e un exchange decentralizzato basato su previsioni (Polymarket). Il focus è sul mercato spot BTCUSDT (Binance) contro il mercato delle previsioni sul prezzo di BTC a fine mese (Polymarket). 
@@ -48,5 +49,5 @@ Il mercato decentralizzato riprezza l'inefficienza seguendo Binance nella metà 
 - L'architettura AWS è stata settata interamente in autonomo senza uso di agent seguendo guide online ufficiali di Amazon stesso e di Google Gemini.
 - La validità MATEMATICA del codice è stata da me più volte confermata e collaudata, si aspettano ulteriori correzioni in caso di svista del sottoscritto.
 - Non è stato ancora effettuato backtest con valori monetari ma solo sulla Mean Reversion in termini temporali.
-- Non è stato ancora calcolato ne Sharpe Ratio classico ne Sharpe Ratio corretto per la non normalità dei rendimenti.
+- Non è stato ancora calcolato né Sharpe Ratio classico né Sharpe Ratio corretto per la non normalità dei rendimenti.
 - Non è stata ancora verificata la validità Out of Sample.
