@@ -8,8 +8,8 @@ L'architettura è divisa tra un ambiente di sviluppo locale e un server di produ
 
 [Ambiente Locale]
 - IDE: Visual Studio Code (VS Code).
-- Versioning: Repository Git per il tracciamento del codice e dei log.
-- Environment: Ambiente virtuale Python dedicato (`bot_env`), isolato per evitare conflitti di dipendenze (situato in `~/Desktop/bot_pm`).
+- Versioning: Repository Git per il tracciamento del codice e dei log. link = https://github.com/alessiocriscio/bot_pm
+- Environment: Ambiente virtuale Python dedicato (`bot_env` versione 3.12.3), isolato per evitare conflitti di dipendenze (situato in `~/Desktop/bot_pm`).
 
 [Ambiente di Produzione Cloud]
 - Provider: Amazon Web Services (AWS).
