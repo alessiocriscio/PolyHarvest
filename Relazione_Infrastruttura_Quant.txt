@@ -1,0 +1,52 @@
+RELAZIONE TECNICA: INFRASTRUTTURA DI ARBITRAGGIO STATISTICO (BINANCE VS POLYMARKET)
+
+1. OVERVIEW DEL SISTEMA
+L'obiettivo del progetto è sfruttare le inefficienze microstrutturali tra un exchange centralizzato ad alta frequenza (Binance) e un exchange decentralizzato basato su previsioni (Polymarket). Il focus è sul mercato spot BTCUSDT (Binance) contro il mercato delle previsioni sul prezzo di BTC a fine mese (Polymarket). 
+
+2. INFRASTRUTTURA E AMBIENTE DI SVILUPPO
+L'architettura è divisa tra un ambiente di sviluppo locale e un server di produzione in cloud per garantire un uptime 24/7.
+
+[Ambiente Locale]
+- IDE: Visual Studio Code (VS Code).
+- Versioning: Repository Git per il tracciamento del codice e dei log.
+- Environment: Ambiente virtuale Python dedicato (`bot_env`), isolato per evitare conflitti di dipendenze (situato in `~/Desktop/bot_pm`).
+
+[Ambiente di Produzione Cloud]
+- Provider: Amazon Web Services (AWS).
+- Istanza EC2: i-03d391c35a739be5a (HFT-Logger).
+- OS: Ubuntu 24.04.4 LTS (GNU/Linux 6.17.0-1007-aws x86_64).
+- IP Pubblico: #######. (Redacted per motivi di privacy)
+- IP Privato: #######. (Redacted per motivi di privacy)
+- Accesso: Autenticazione crittografica tramite chiave SSH (bot_key.pem) con permessi blindati (chmod 400).
+- Funzione: Logging ininterrotto della microstruttura del book per la raccolta dati (data_dump_weekend.csv).
+
+3. MODELLO QUANTITATIVO (LOGICA CORE)
+Il motore logico analizza la "pressione" del mercato calcolando l'Order Book Imbalance (OBI) sui primi 5 livelli (Bid/Ask) di entrambi gli exchange.
+
+- Filtro Rumore (Binance): Dato l'alto volume di HFT e spoofing su Binance, l'OBI grezzo viene smussato utilizzando una Media Mobile Esponenziale (EMA) a 15 periodi.
+- Reattività (Polymarket): L'OBI di Polymarket viene mantenuto RAW (grezzo) per garantire la massima reattività ai piazzamenti reali di liquidità, dato il minor rumore di fondo.
+- Trigger Statistico: Lo spread tra EMA_Binance e RAW_Polymarket viene standardizzato tramite uno Z-Score calcolato su una finestra mobile di 80 periodi. 
+- Segnale Operativo: Il sistema genera un segnale di ingresso quando lo scostamento esplode superando le due deviazioni standard (|Z| > 2.0).
+
+4. RISULTATI DEL BACKTEST (MEAN REVERSION)
+L'analisi quantitativa condotta sul dataset di 5 giorni (15-20 Aprile 2026, 178.275 rilevazioni) ha confermato la solidità dell'Alpha:
+- Spread medio al trigger: ~0.69 (divergenza massiccia di imbalance).
+- Frequenza Segnali: 2.288 inefficienze identificate.
+- Mean Reversion Time (Mediana): 32.00 secondi.
+- Max Drawdown Temporale: 219 secondi.
+Il mercato decentralizzato riprezza l'inefficienza seguendo Binance nella metà dei casi in circa trentadue secondi.
+
+5. TO-DO LIST:
+- Strutturare un bot di esecuzione per la strategy live.
+- Raffinare il bot di analisi e data logging in caso di rilevazione di delay inaccettabile.
+- Effettuare data logging per altri mercati (es. commodities) per verificare se sussiste unicità nell'asset preso in esame o se ci si trova di fronte ad una tendenza.
+
+6. NOTE IMPORTANTI
+- Tutta la strategia è stata elaborata dal sottoscritto, basandosi su analisi recenti dei mercati predittivi.
+- L'uso delle metriche statistiche si deve al pregresso del sottoscritto negli esami precedenti e a letture autonome.
+- La traduzione in codice è stata effettuata in modo ibrido: personal knowledge e AI per funzioni o cicli computazionali complessi. L'AI ha assistito SOLO la mera traduzione in codice della strategia.
+- L'architettura AWS è stata settata interamente in autonomo senza uso di agent seguendo guide online ufficiali di Amazon stesso e di Google Gemini.
+- La validità MATEMATICA del codice è stata da me più volte confermata e collaudata, si aspettano ulteriori correzioni in caso di svista del sottoscritto.
+- Non è stato ancora effettuato backtest con valori monetari ma solo sulla Mean Reversion in termini temporali.
+- Non è stato ancora calcolato ne Sharpe Ratio classico ne Sharpe Ratio corretto per la non normalità dei rendimenti.
+- Non è stata ancora verificata la validità Out of Sample.
