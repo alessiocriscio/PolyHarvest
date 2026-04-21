@@ -13,6 +13,7 @@ from obi_engine import calculate_obi
 
 tor_process = None
 
+
 def init_db():
     conn = sqlite3.connect('market_data.db')
     c = conn.cursor()
@@ -84,8 +85,14 @@ def extract_strike_price(text):
 def main():
     print(f"[SYSTEM] Kernel: {sys.version.split()[0]}")
     start_tor()
-    db_conn = init_db()
-    db_cursor = db_conn.cursor()
+    log_var = input("Start data logging ? Y(Yes)/N(No)\n")
+    if log_var == "Y" or log_var == "y":
+        print("Data logging enabled.")
+        db_conn = init_db()
+        db_cursor = db_conn.cursor()
+    else:
+        db_conn = None
+        db_cursor = None
 
     proxies = {'http': 'socks5h://127.0.0.1:9050', 'https': 'socks5h://127.0.0.1:9050'}
     headers = {'User-Agent': 'Mozilla/5.0'}
@@ -138,7 +145,9 @@ def main():
 
     alpha, ema_binance, spread_history = 0.125, None, []
     
-    print(f"[DATA LOGGER ACTIVE] Recording data to market_data.db...")
+    if db_cursor is not None:
+        print(f"[DATA LOGGER ACTIVE] Recording data to market_data.db...")
+
 
     while True:
         try:
@@ -174,15 +183,18 @@ def main():
                     direction = "BUY (PM Underpriced)" if z_score > 0 else "SELL (PM Overpriced)"
                     print(f"\n TRIGGER! Z-Score: {z_score:.2f} | {direction} | Spread: {divergence:.4f}")
 
-            db_cursor.execute("INSERT INTO spread_log (ticker, binance_obi_raw, binance_ema, polymarket_obi, spread, z_score) VALUES (?, ?, ?, ?, ?, ?)", (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score))
-            db_conn.commit()
+            if db_cursor is not None:
+                db_cursor.execute("INSERT INTO spread_log (ticker, binance_obi_raw, binance_ema, polymarket_obi, spread, z_score) VALUES (?, ?, ?, ?, ?, ?)", 
+                                  (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score))
+                db_conn.commit()
 
             print(f"Logging... Z-Score: {z_score:.2f} | Spread: {divergence:.4f}      ", end="\r", flush=True)
             time.sleep(2)
 
         except KeyboardInterrupt:
             break
-        except Exception:
+        except Exception as e:
+            print(f"[ERROR] Engine Failure: {e}") # Fondamentale per non essere ciechi
             time.sleep(2)
             continue
 
