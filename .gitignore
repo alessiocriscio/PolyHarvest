@@ -2,4 +2,4 @@ pm_env/
 *.db
 __pycache__/
 .vscode/
-
+.claude/
