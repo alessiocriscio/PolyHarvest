@@ -25,6 +25,25 @@ def save_obi(obi, filename):
     with open(filename, 'a') as f:
         f.write(str(obi) + '\n')
 
+def parse_ibkr_depth(dom_bids, dom_asks, top_n=5):
+    """
+    Takes lists of ib_insync.DOMLevel objects for bids and asks,
+    takes the top top_n levels by size, aggregates bid and ask volumes, and returns a DataFrame
+    with columns bid_size and ask_size.
+    """
+    # Function to extract size safely from DOMLevel object or dict
+    def get_size(level):
+        return getattr(level, 'size', level.get('size', 0) if isinstance(level, dict) else 0)
+        
+    # Sort by size descending and take top_n
+    bids_sorted = sorted(dom_bids, key=get_size, reverse=True)[:top_n]
+    asks_sorted = sorted(dom_asks, key=get_size, reverse=True)[:top_n]
+    
+    bid_vol = sum(get_size(b) for b in bids_sorted)
+    ask_vol = sum(get_size(a) for a in asks_sorted)
+    
+    return pd.DataFrame({"bid_size": [bid_vol], "ask_size": [ask_vol]})
+
 if __name__ == "__main__":
     # Generating a dummy DataFrame for testing
     data = {
