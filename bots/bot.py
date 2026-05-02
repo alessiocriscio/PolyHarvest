@@ -9,12 +9,9 @@ import os
 import re
 import sqlite3
 import numpy as np
-from obi_engine import calculate_obi, parse_ibkr_depth
-from ib_insync import IB, Future, util
+from obi_engine import calculate_obi
 
 tor_process = None
-ib = None
-ibkr_contract = None
 
 
 def init_db():
@@ -32,13 +29,11 @@ def init_db():
     return conn
 
 def cleanup():
-    global tor_process, ib
+    global tor_process
     print("\n[SYSTEM] Shutting down Tor tunnel...")
     if tor_process:
         tor_process.terminate()
     os.system("killall tor 2>/dev/null")
-    if ib and ib.isConnected():
-        ib.disconnect()
 
 atexit.register(cleanup)
 
@@ -87,40 +82,9 @@ def extract_strike_price(text):
     numbers = [float(m.replace(',', '')) for m in matches]
     return max(numbers)
 
-def get_futures_price(contract):
-    if not ib or not ib.isConnected():
-        return None
-    try:
-        ticker = ib.reqMktData(contract, '', False, False)
-        ib.sleep(1)
-        ib.cancelMktData(contract)
-        return ticker.last if ticker.last == ticker.last else (ticker.close if ticker.close == ticker.close else None)
-    except Exception:
-        return None
-
-def get_futures_obi(contract):
-    if not ib or not ib.isConnected():
-        return 0
-    try:
-        ticker = ib.reqMktDepth(contract, numRows=5)
-        ib.sleep(1)
-        ib.cancelMktDepth(contract)
-        
-        df = parse_ibkr_depth(ticker.domBids, ticker.domAsks, top_n=5)
-        return calculate_obi(df) if (df['bid_size'].iloc[0] + df['ask_size'].iloc[0]) > 0 else 0
-    except Exception:
-        return 0
-
 def main():
-    global ib
     print(f"[SYSTEM] Kernel: {sys.version.split()[0]}")
     start_tor()
-    
-    print("\nStartup Menu:")
-    print("1) Crypto - Binance")
-    print("2) Commodities - IBKR")
-    choice = input("Select mode (1/2): ").strip()
-    
     log_var = input("Start data logging ? Y(Yes)/N(No)\n")
     if log_var == "Y" or log_var == "y":
         print("Data logging enabled.")
@@ -134,33 +98,13 @@ def main():
     headers = {'User-Agent': 'Mozilla/5.0'}
 
     url = input("\nEnter Polymarket URL: ").strip()
-    
-    if choice == "2":
-        ticker = input("Enter IBKR Future Local Symbol (e.g., CLQ25): ").strip().upper()
-        print("[SYSTEM] Connecting to IB Gateway on 127.0.0.1:4001...")
-        try:
-            ib = IB()
-            ib.connect('127.0.0.1', 4001, clientId=1)
-            print("[SYSTEM] Connected to IBKR.")
-            global ibkr_contract
-            ibkr_contract = Future(localSymbol=ticker, exchange='NYMEX')
-            ib.qualifyContracts(ibkr_contract)
-        except Exception as e:
-            print(f"[ERROR] Failed to connect to IBKR: {e}")
-            return
-    else:
-        ticker = input("Enter Binance Ticker (e.g., BTCUSDT): ").strip().upper()
-        
+    ticker = input("Enter Binance Ticker (e.g., BTCUSDT): ").strip().upper()
     try:
         z_threshold = float(input("Enter Z-Score threshold for alerts (e.g., 2.0): "))
     except ValueError:
         z_threshold = 2.0
 
-    if choice == "2":
-        current_spot_price = get_futures_price(ibkr_contract)
-    else:
-        current_spot_price = get_binance_price(ticker)
-        
+    current_spot_price = get_binance_price(ticker)
     if current_spot_price is None: return
 
     slug = url.rstrip('/').split('/')[-1].split('?')[0]
@@ -216,11 +160,7 @@ def main():
             v_a_pm = asks_pm.head(5)['size'].astype(float).sum() if not asks_pm.empty else 0
             obi_pm = calculate_obi(pd.DataFrame({"bid_size": [v_b_pm], "ask_size": [v_a_pm]})) if (v_b_pm + v_a_pm) > 0 else 0
 
-            if choice == "2":
-                obi_trad_raw = get_futures_obi(ibkr_contract)
-            else:
-                obi_trad_raw = get_binance_obi(symbol=ticker)
-                
+            obi_trad_raw = get_binance_obi(symbol=ticker)
             ema_binance = obi_trad_raw if ema_binance is None else (obi_trad_raw * alpha) + (ema_binance * (1 - alpha))
 
             # DIRECTIONAL SPREAD: No abs() to maintain signal direction
@@ -249,20 +189,13 @@ def main():
                 db_conn.commit()
 
             print(f"Logging... Z-Score: {z_score:.2f} | Spread: {divergence:.4f}      ", end="\r", flush=True)
-            
-            if choice == "2" and ib and ib.isConnected():
-                ib.sleep(2)
-            else:
-                time.sleep(2)
+            time.sleep(2)
 
         except KeyboardInterrupt:
             break
         except Exception as e:
             print(f"[ERROR] Engine Failure: {e}")
-            if choice == "2" and ib and ib.isConnected():
-                ib.sleep(2)
-            else:
-                time.sleep(2)
+            time.sleep(2)
             continue
 
 if __name__ == "__main__":
