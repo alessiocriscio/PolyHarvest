@@ -189,6 +189,7 @@ def main():
 
     alpha, ema_binance, spread_history = 0.125, None, []
     empty_book_streak = 0
+    in_trade = False
 
     if db_cursor is not None:
         print(f"[DATA LOGGER ACTIVE] Recording data to market_data.db...")
@@ -246,7 +247,8 @@ def main():
                     z_score = (divergence - mean) / std
                 
                 # SIGNAL TO EXECUTOR IF THRESHOLD IS BREACHED
-                if abs(z_score) > z_threshold:
+                if abs(z_score) > z_threshold and not in_trade:
+                    in_trade = True
                     if z_score > 0:
                         direction = "BUY (PM Underpriced)"
                         sig_price = round(best_ask - 0.01, 2)
@@ -264,6 +266,10 @@ def main():
                         sig_price = round(best_ask_no - 0.01, 2)
                         order_id, fill_status = send_executor_signal(token_no, "BUY", sig_price, 10)
                     print(f"\n TRIGGER! Z-Score: {z_score:.2f} | {direction} | Spread: {divergence:.4f} | Order: {fill_status}")
+
+                elif in_trade and abs(z_score) < 0.5:
+                    in_trade = False
+                    print(f"\n[EXIT] Z-Score back to {z_score:.2f} | Position closed")
 
             if db_cursor is not None:
                 db_cursor.execute(
