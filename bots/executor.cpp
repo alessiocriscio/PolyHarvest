@@ -1,6 +1,6 @@
 // executor.cpp — Low-latency Polymarket order execution engine
 // Polymarket CLOB V2 — EIP-712 signed limit orders
-// Deps: C++17, libcurl, libssl/libcrypto, nlohmann/json
+// Deps: C++20, libcurl, libssl/libcrypto, nlohmann/json
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -19,6 +19,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
+#include <chrono>
 
 #include <curl/curl.h>
 #include <openssl/bn.h>
@@ -64,8 +65,6 @@ static std::vector<uint8_t> from_hex(const std::string &h) {
 }
 
 // ─── standalone keccak-256 (portable, no OpenSSL digest dependency) ──────────
-// Keccak-f[1600] sponge: rate=1088 bits, capacity=512 bits, output=256 bits.
-// Uses Keccak padding (0x01), NOT SHA3 padding (0x06).
 namespace keccak_impl {
 
 static constexpr int ROUNDS = 24;
@@ -82,7 +81,7 @@ static constexpr int ROT[25] = {0,  1, 62, 28, 27, 36, 44, 6,  55,
                                 20, 3, 10, 43, 25, 39, 41, 45, 15,
                                 21, 8, 18, 2,  61, 56, 14};
 static constexpr int PI[25] = {0,  10, 7,  11, 17, 18, 3,  5,  16, 8, 21, 24, 4,
-                               15, 23, 19, 13, 12, 2,  20, 14, 22, 9, 6,  1};
+                                15, 23, 19, 13, 12, 2,  20, 14, 22, 9, 6,  1};
 
 inline uint64_t rotl64(uint64_t x, int n) { return (x << n) | (x >> (64 - n)); }
 
@@ -186,118 +185,30 @@ static std::vector<uint8_t> abi_encode_bytes32(const std::vector<uint8_t> &b) {
   return buf;
 }
 
-// ─── generate random 256-bit salt ────────────────────────────────────────────
+// ─── high-performance random 256-bit salt (no multiple BIGNUM allocations) ──
 static std::string random_salt() {
-  std::random_device rd;
-  std::mt19937_64 gen(rd());
+  static thread_local std::mt19937_64 gen(std::random_device{}());
   std::uniform_int_distribution<uint64_t> dist;
-  // 4 x 64-bit → 256-bit, returned as decimal
-  BIGNUM *bn = BN_new();
-  BN_zero(bn);
-  for (int i = 0; i < 4; ++i) {
-    BN_lshift(bn, bn, 64);
-    BIGNUM *part = BN_new();
-    BN_set_word(part, dist(gen));
-    BN_add(bn, bn, part);
-    BN_free(part);
+
+  uint64_t p0 = dist(gen);
+  uint64_t p1 = dist(gen);
+  uint64_t p2 = dist(gen);
+  uint64_t p3 = dist(gen);
+
+  uint8_t bytes[32];
+  for (int i = 0; i < 8; ++i) {
+    bytes[i]      = static_cast<uint8_t>((p0 >> (56 - i * 8)) & 0xFF);
+    bytes[8 + i]  = static_cast<uint8_t>((p1 >> (56 - i * 8)) & 0xFF);
+    bytes[16 + i] = static_cast<uint8_t>((p2 >> (56 - i * 8)) & 0xFF);
+    bytes[24 + i] = static_cast<uint8_t>((p3 >> (56 - i * 8)) & 0xFF);
   }
+
+  BIGNUM *bn = BN_bin2bn(bytes, 32, nullptr);
   char *s = BN_bn2dec(bn);
   std::string out(s);
   OPENSSL_free(s);
   BN_free(bn);
   return out;
-}
-
-// ─── derive Ethereum address from private key ────────────────────────────────
-static std::string derive_address(const std::vector<uint8_t> &privkey) {
-  EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
-  EVP_PKEY_keygen_init(pctx);
-  EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_secp256k1);
-
-  EVP_PKEY *pkey = nullptr;
-  // Build from raw private key
-  BIGNUM *priv_bn = BN_bin2bn(privkey.data(), privkey.size(), nullptr);
-  EC_KEY *ec = EC_KEY_new_by_curve_name(NID_secp256k1);
-  EC_KEY_set_private_key(ec, priv_bn);
-
-  const EC_GROUP *grp = EC_KEY_get0_group(ec);
-  EC_POINT *pub = EC_POINT_new(grp);
-  EC_POINT_mul(grp, pub, priv_bn, nullptr, nullptr, nullptr);
-  EC_KEY_set_public_key(ec, pub);
-
-  // Serialize uncompressed public key (65 bytes: 0x04 || x || y)
-  size_t plen = EC_POINT_point2oct(grp, pub, POINT_CONVERSION_UNCOMPRESSED,
-                                   nullptr, 0, nullptr);
-  std::vector<uint8_t> pubbuf(plen);
-  EC_POINT_point2oct(grp, pub, POINT_CONVERSION_UNCOMPRESSED, pubbuf.data(),
-                     plen, nullptr);
-
-  // Keccak-256 of x||y (skip the 0x04 prefix)
-  auto hash = keccak256(pubbuf.data() + 1, plen - 1);
-  // Last 20 bytes = address
-  std::string addr = "0x" + to_hex(hash.data() + 12, 20);
-
-  EC_POINT_free(pub);
-  BN_free(priv_bn);
-  EC_KEY_free(ec);
-  EVP_PKEY_CTX_free(pctx);
-  return addr;
-}
-
-// ─── secp256k1 sign digest → (r, s, v) packed 65-byte sig ───────────────────
-static std::string sign_digest(const std::array<uint8_t, 32> &digest,
-                               const std::vector<uint8_t> &privkey) {
-  EC_KEY *ec = EC_KEY_new_by_curve_name(NID_secp256k1);
-  BIGNUM *priv_bn = BN_bin2bn(privkey.data(), privkey.size(), nullptr);
-  EC_KEY_set_private_key(ec, priv_bn);
-
-  const EC_GROUP *grp = EC_KEY_get0_group(ec);
-  EC_POINT *pub = EC_POINT_new(grp);
-  EC_POINT_mul(grp, pub, priv_bn, nullptr, nullptr, nullptr);
-  EC_KEY_set_public_key(ec, pub);
-
-  ECDSA_SIG *sig = ECDSA_do_sign(digest.data(), 32, ec);
-  const BIGNUM *r_bn = nullptr;
-  const BIGNUM *s_bn = nullptr;
-  ECDSA_SIG_get0(sig, &r_bn, &s_bn);
-
-  // Ensure low-S (EIP-2)
-  BIGNUM *half_order = BN_new();
-  const BIGNUM *order = EC_GROUP_get0_order(grp);
-  BN_rshift1(half_order, order);
-
-  BIGNUM *s_adj = BN_dup(s_bn);
-  int v = 27;
-  if (BN_cmp(s_adj, half_order) > 0) {
-    BN_sub(s_adj, order, s_adj);
-    v = 28;
-  }
-
-  // Pack r (32 bytes) || s (32 bytes) || v (1 byte)
-  std::vector<uint8_t> r_bytes(32, 0), s_bytes(32, 0);
-  BN_bn2bin(r_bn, r_bytes.data() + (32 - BN_num_bytes(r_bn)));
-  BN_bn2bin(s_adj, s_bytes.data() + (32 - BN_num_bytes(s_adj)));
-
-  // Recovery id: try both 27 and 28
-  for (int try_v = 27; try_v <= 28; ++try_v) {
-    // We'll just use the initial v calculation
-    // A proper recovery would verify, but this is sufficient for the API
-  }
-  (void)v; // Use computed v
-
-  std::string hex_sig =
-      "0x" + to_hex(r_bytes.data(), 32) + to_hex(s_bytes.data(), 32);
-  // Append v byte
-  uint8_t vb = static_cast<uint8_t>(v);
-  hex_sig += to_hex(&vb, 1);
-
-  BN_free(half_order);
-  BN_free(s_adj);
-  ECDSA_SIG_free(sig);
-  EC_POINT_free(pub);
-  BN_free(priv_bn);
-  EC_KEY_free(ec);
-  return hex_sig;
 }
 
 // ─── EIP-712 hashing (Polymarket V2) ─────────────────────────────────────────
@@ -321,7 +232,7 @@ static std::array<uint8_t, 32> order_type_hash() {
 }
 
 static std::array<uint8_t, 32>
-compute_domain_separator(const std::string &maker_addr) {
+compute_domain_separator(const std::string &/*maker_addr*/) {
   auto dt = domain_type_hash();
   auto name_hash = keccak256(std::string(DOMAIN_NAME));
   auto ver_hash = keccak256(std::string(DOMAIN_VERSION));
@@ -402,9 +313,6 @@ static size_t curl_write_cb(void *ptr, size_t sz, size_t nm, std::string *s) {
 }
 
 // ─── convert user-facing price/size to maker/taker amounts ───────────────────
-// Polymarket uses 6-decimal fixed-point (USDC / pUSD).
-// makerAmount = size (in outcome tokens, 6 dec) for BUY; price*size for SELL
-// takerAmount = price*size for BUY; size for SELL
 static void compute_amounts(const std::string &side, double price, double size,
                             std::string &maker_amount,
                             std::string &taker_amount) {
@@ -438,23 +346,187 @@ public:
     passphrase_ = pp;
     secret_ = sec ? sec : "";
     privkey_ = from_hex(std::string(pk));
-    address_ = derive_address(privkey_);
 
+    // 1. Initialize OpenSSL keys once
+    ec_key_ = EC_KEY_new_by_curve_name(NID_secp256k1);
+    if (!ec_key_) {
+      throw std::runtime_error("EC_KEY_new_by_curve_name failed");
+    }
+
+    BIGNUM *priv_bn = BN_bin2bn(privkey_.data(), privkey_.size(), nullptr);
+    if (!priv_bn) {
+      EC_KEY_free(ec_key_);
+      throw std::runtime_error("BN_bin2bn failed");
+    }
+    EC_KEY_set_private_key(ec_key_, priv_bn);
+
+    const EC_GROUP *grp = EC_KEY_get0_group(ec_key_);
+    EC_POINT *pub = EC_POINT_new(grp);
+    if (!pub) {
+      BN_free(priv_bn);
+      EC_KEY_free(ec_key_);
+      throw std::runtime_error("EC_POINT_new failed");
+    }
+    EC_POINT_mul(grp, pub, priv_bn, nullptr, nullptr, nullptr);
+    EC_KEY_set_public_key(ec_key_, pub);
+
+    // Cache order and half-order
+    order_ = BN_new();
+    half_order_ = BN_new();
+    if (!order_ || !half_order_) {
+      EC_POINT_free(pub);
+      BN_free(priv_bn);
+      EC_KEY_free(ec_key_);
+      throw std::runtime_error("BN_new failed");
+    }
+    BN_copy(order_, EC_GROUP_get0_order(grp));
+    BN_rshift1(half_order_, order_);
+
+    // Derive wallet address from public key
+    size_t plen = EC_POINT_point2oct(grp, pub, POINT_CONVERSION_UNCOMPRESSED,
+                                     nullptr, 0, nullptr);
+    std::vector<uint8_t> pubbuf(plen);
+    EC_POINT_point2oct(grp, pub, POINT_CONVERSION_UNCOMPRESSED, pubbuf.data(),
+                       plen, nullptr);
+
+    // Keccak-256 of x||y (skip the 0x04 prefix)
+    auto hash = keccak256(pubbuf.data() + 1, plen - 1);
+    address_ = "0x" + to_hex(hash.data() + 12, 20);
+
+    // Free local temporaries
+    EC_POINT_free(pub);
+    BN_free(priv_bn);
+
+    // Tor configuration
     const char *tor_env = std::getenv("USE_TOR");
     use_tor_ = (tor_env && std::string(tor_env) == "1");
-    if (use_tor_)
+
+    // 2. Initialize Persistent libcurl handle (HTTP Keep-Alive)
+    curl_global_init(CURL_GLOBAL_ALL);
+    curl_handle_ = curl_easy_init();
+    if (!curl_handle_) {
+      throw std::runtime_error("curl_easy_init failed");
+    }
+
+    if (use_tor_) {
       std::cerr << "[executor] SOCKS5 proxy enabled: 127.0.0.1:9050\n";
+      curl_easy_setopt(curl_handle_, CURLOPT_PROXY, "socks5h://127.0.0.1:9050");
+      curl_easy_setopt(curl_handle_, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS5_HOSTNAME);
+    }
+
+    // Configure common low-latency libcurl options
+    curl_easy_setopt(curl_handle_, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl_handle_, CURLOPT_TIMEOUT, 5L);
+    curl_easy_setopt(curl_handle_, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl_handle_, CURLOPT_TCP_KEEPIDLE, 120L);
+    curl_easy_setopt(curl_handle_, CURLOPT_TCP_KEEPINTVL, 60L);
 
     std::cerr << "[executor] Wallet address: " << address_ << "\n";
-
-    curl_global_init(CURL_GLOBAL_ALL);
   }
 
-  ~Executor() { curl_global_cleanup(); }
+  ~Executor() {
+    if (curl_handle_) {
+      curl_easy_cleanup(curl_handle_);
+    }
+    if (ec_key_) {
+      EC_KEY_free(ec_key_);
+    }
+    if (order_) {
+      BN_free(order_);
+    }
+    if (half_order_) {
+      BN_free(half_order_);
+    }
+    curl_global_cleanup();
+  }
+
+  // mathematically correct signature generation with exact v recovery
+  std::string sign_digest(const std::array<uint8_t, 32> &digest) const {
+    ECDSA_SIG *sig = ECDSA_do_sign(digest.data(), 32, ec_key_);
+    if (!sig) {
+      throw std::runtime_error("ECDSA_do_sign failed");
+    }
+
+    const BIGNUM *r_bn = nullptr;
+    const BIGNUM *s_bn = nullptr;
+    ECDSA_SIG_get0(sig, &r_bn, &s_bn);
+
+    BIGNUM *s_adj = BN_dup(s_bn);
+    if (!s_adj) {
+      ECDSA_SIG_free(sig);
+      throw std::runtime_error("BN_dup failed");
+    }
+
+    // Ensure low-S canonical form (EIP-2)
+    if (BN_cmp(s_adj, half_order_) > 0) {
+      BN_sub(s_adj, order_, s_adj);
+    }
+
+    // Mathematically rigorous public key recovery to determine correct v
+    int v = 27;
+    const EC_GROUP *grp = EC_KEY_get0_group(ec_key_);
+    const EC_POINT *Q_pub = EC_KEY_get0_public_key(ec_key_);
+
+    BN_CTX *ctx = BN_CTX_new();
+    if (ctx) {
+      BN_CTX_start(ctx);
+      BIGNUM *r_inv = BN_CTX_get(ctx);
+      BIGNUM *e_bn = BN_CTX_get(ctx);
+      BIGNUM *neg_e = BN_CTX_get(ctx);
+
+      if (r_inv && e_bn && neg_e) {
+        BN_mod_inverse(r_inv, r_bn, order_, ctx);
+        BN_bin2bn(digest.data(), 32, e_bn);
+        BN_mod_sub(neg_e, order_, e_bn, order_, ctx); // neg_e = order - e
+
+        EC_POINT *R = EC_POINT_new(grp);
+        EC_POINT *Q_cand = EC_POINT_new(grp);
+
+        if (R && Q_cand) {
+          for (int y_bit = 0; y_bit <= 1; ++y_bit) {
+            // Reconstruct point R with x = r and y-parity = y_bit
+            if (EC_POINT_set_compressed_coordinates(grp, R, r_bn, y_bit, ctx) == 1) {
+              // Q_cand = neg_e * G + s_adj * R
+              if (EC_POINT_mul(grp, Q_cand, neg_e, R, s_adj, ctx) == 1) {
+                // Q_cand = r_inv * Q_cand
+                if (EC_POINT_mul(grp, Q_cand, nullptr, Q_cand, r_inv, ctx) == 1) {
+                  // Compare with our public key
+                  if (EC_POINT_cmp(grp, Q_cand, Q_pub, ctx) == 0) {
+                    v = 27 + y_bit;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
+        if (Q_cand) EC_POINT_free(Q_cand);
+        if (R) EC_POINT_free(R);
+      }
+      BN_CTX_end(ctx);
+      BN_CTX_free(ctx);
+    }
+
+    // Pack r (32 bytes) || s (32 bytes) || v (1 byte)
+    std::vector<uint8_t> r_bytes(32, 0), s_bytes(32, 0);
+    BN_bn2bin(r_bn, r_bytes.data() + (32 - BN_num_bytes(r_bn)));
+    BN_bn2bin(s_adj, s_bytes.data() + (32 - BN_num_bytes(s_adj)));
+
+    std::string hex_sig =
+        "0x" + to_hex(r_bytes.data(), 32) + to_hex(s_bytes.data(), 32);
+    uint8_t vb = static_cast<uint8_t>(v);
+    hex_sig += to_hex(&vb, 1);
+
+    BN_free(s_adj);
+    ECDSA_SIG_free(sig);
+    return hex_sig;
+  }
 
   // Process one incoming signal → place order → return result JSON
   json process_signal(const json &sig) {
     try {
+      auto start_time = std::chrono::high_resolution_clock::now();
+
       std::string token_id = sig.at("token_id").get<std::string>();
       std::string side_str = sig.at("side").get<std::string>(); // "BUY"/"SELL"
       double price = sig.at("price").get<double>();
@@ -483,9 +555,9 @@ public:
       op.metadata = std::vector<uint8_t>(32, 0);
       op.builder = std::vector<uint8_t>(32, 0);
 
-      // EIP-712 sign
+      // EIP-712 sign (utilizes cached keys)
       auto digest = eip712_hash(op);
-      auto sig_hex = sign_digest(digest, privkey_);
+      auto sig_hex = sign_digest(digest);
 
       // Build POST body
       json body;
@@ -511,37 +583,32 @@ public:
       std::string hmac_msg = ts_sec + "POST" + ORDER_ENDPOINT + body_str;
       std::string hmac_sig = hmac_sha256_hex(secret_, hmac_msg);
 
-      // HTTP POST via libcurl
-      std::string url = std::string(CLOB_HOST) + ORDER_ENDPOINT;
-      std::string response;
-
-      CURL *curl = curl_easy_init();
+      // HTTP Headers list (rebuild list is cheap, handles dynamic headers)
       struct curl_slist *hdrs = nullptr;
       hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
       hdrs = curl_slist_append(hdrs, ("POLY_ADDRESS: " + address_).c_str());
       hdrs = curl_slist_append(hdrs, ("POLY_SIGNATURE: " + hmac_sig).c_str());
       hdrs = curl_slist_append(hdrs, ("POLY_TIMESTAMP: " + ts_sec).c_str());
       hdrs = curl_slist_append(hdrs, ("POLY_API_KEY: " + api_key_).c_str());
-      hdrs =
-          curl_slist_append(hdrs, ("POLY_PASSPHRASE: " + passphrase_).c_str());
+      hdrs = curl_slist_append(hdrs, ("POLY_PASSPHRASE: " + passphrase_).c_str());
 
-      curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-      curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-      curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_str.c_str());
-      curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
-      curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-      curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+      std::string url = std::string(CLOB_HOST) + ORDER_ENDPOINT;
+      std::string response;
 
-      if (use_tor_) {
-        curl_easy_setopt(curl, CURLOPT_PROXY, "socks5h://127.0.0.1:9050");
-        curl_easy_setopt(curl, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS5_HOSTNAME);
-      }
+      // Re-configure curl handle (reuses connection)
+      curl_easy_setopt(curl_handle_, CURLOPT_URL, url.c_str());
+      curl_easy_setopt(curl_handle_, CURLOPT_HTTPHEADER, hdrs);
+      curl_easy_setopt(curl_handle_, CURLOPT_POSTFIELDS, body_str.c_str());
+      curl_easy_setopt(curl_handle_, CURLOPT_WRITEDATA, &response);
 
-      CURLcode res = curl_easy_perform(curl);
+      CURLcode res = curl_easy_perform(curl_handle_);
       long http_code = 0;
-      curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+      curl_easy_getinfo(curl_handle_, CURLINFO_RESPONSE_CODE, &http_code);
       curl_slist_free_all(hdrs);
-      curl_easy_cleanup(curl);
+
+      auto end_time = std::chrono::high_resolution_clock::now();
+      auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+      std::cerr << "[executor] Total execution loop time: " << elapsed_us << " us\n";
 
       if (res != CURLE_OK) {
         return {{"status", "error"},
@@ -583,6 +650,11 @@ public:
   }
 
 private:
+  EC_KEY *ec_key_ = nullptr;
+  BIGNUM *order_ = nullptr;
+  BIGNUM *half_order_ = nullptr;
+  CURL *curl_handle_ = nullptr;
+
   std::vector<uint8_t> privkey_;
   std::string address_;
   std::string api_key_;
