@@ -12,7 +12,11 @@ import sqlite3
 import sys
 
 DB_PATH = "market_data.db"
-SIZE = 10
+try:
+    _user_input = input("Enter capital per trade in USD (default: 1.0): ").strip()
+    TRADE_SIZE = float(_user_input) if _user_input else 1.0
+except Exception:
+    TRADE_SIZE = 1.0
 EXIT_Z_THRESHOLD = 0.5
 
 
@@ -83,11 +87,11 @@ def run_backtest():
 
             if is_buy_yes:
                 exit_price = exit_row["pm_best_bid"] or 0
-                pnl = (exit_price - entry_price) * SIZE
+                pnl = (exit_price - entry_price) * TRADE_SIZE
             else:
                 # BUY No exit: approximate No price = 1 - Yes ask (Yes + No = 1)
                 exit_price = round(1.0 - (exit_row["pm_best_ask"] or 0), 2)
-                pnl = (exit_price - entry_price) * SIZE
+                pnl = (exit_price - entry_price) * TRADE_SIZE
 
             trades.append({
                 "entry_time": row["timestamp"],
