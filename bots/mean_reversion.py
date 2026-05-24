@@ -5,7 +5,7 @@ print("--- BACKTEST ---")
 
 try:
     # 1. Loading dataset
-    df = pd.read_csv('/Users/alessiocriscio/Desktop/bot_pm/logged_data/ETH_data.csv')
+    df = pd.read_csv('logged_data/BTC_5m_clean.csv')
     
     # 2. Pulizia e formattazione dei dati
     df['z_score'] = pd.to_numeric(df['z_score'], errors='coerce')

@@ -102,6 +102,32 @@ def run_backtest():
                 "pnl": round(pnl, 4),
                 "z_entry": round(z_at_entry, 2),
             })
+        elif row["fill_status"] == "expired":
+            # Find the most recent preceding row with fill_status = 'ok'
+            entry_row = None
+            for j in range(i - 1, -1, -1):
+                if rows[j]["fill_status"] == "ok":
+                    entry_row = rows[j]
+                    break
+
+            if entry_row is not None:
+                entry_price = round((entry_row["pm_best_ask"] or 0) - 0.01, 2)
+                z_at_entry = entry_row["z_score"] or 0
+                is_buy_yes = z_at_entry > 0
+
+                exit_price = 0.5
+                pnl = (exit_price - entry_price) * TRADE_SIZE
+
+                trades.append({
+                    "entry_time": entry_row["timestamp"],
+                    "exit_time": row["timestamp"],
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "side": "BUY Yes [EXPIRED]" if is_buy_yes else "BUY No [EXPIRED]",
+                    "pnl": round(pnl, 4),
+                    "z_entry": round(z_at_entry, 2),
+                    "is_expired": True
+                })
         i += 1
 
     # ─── Report ───
@@ -109,9 +135,15 @@ def run_backtest():
         print("[BACKTEST] No filled trades found (fill_status = 'ok').")
         return
 
-    total_pnl = sum(t["pnl"] for t in trades)
-    wins = sum(1 for t in trades if t["pnl"] > 0)
-    win_rate = wins / len(trades) * 100
+    normal_trades = [t for t in trades if not t.get("is_expired", False)]
+    expired_trades = [t for t in trades if t.get("is_expired", False)]
+
+    total_pnl = sum(t["pnl"] for t in normal_trades)
+    wins = sum(1 for t in normal_trades if t["pnl"] > 0)
+    win_rate = (wins / len(normal_trades) * 100) if normal_trades else 0.0
+
+    expired_count = len(expired_trades)
+    expired_pnl = sum(t["pnl"] for t in expired_trades)
 
     # Max drawdown
     cumulative = 0
@@ -128,19 +160,21 @@ def run_backtest():
     print("=" * 65)
     print("  BACKTEST P&L REPORT")
     print("=" * 65)
-    print(f"  Trades:          {len(trades)}")
-    print(f"  Total P&L:       {total_pnl:+.4f}")
-    print(f"  Avg P&L/trade:   {total_pnl / len(trades):+.4f}")
+    print(f"  Normal Trades:   {len(normal_trades)}")
+    print(f"  Normal P&L:      {total_pnl:+.4f}")
+    print(f"  Avg Normal P&L:  {(total_pnl / len(normal_trades)):+.4f}" if normal_trades else "  Avg Normal P&L:  +0.0000")
     print(f"  Win rate:        {win_rate:.1f}%")
+    print(f"  Expired Trades:  {expired_count}")
+    print(f"  Expired P&L:     {expired_pnl:+.4f}")
     print(f"  Max drawdown:    {max_dd:.4f}")
     print("=" * 65)
     print()
 
     # Detail table
-    print(f"{'#':<4} {'Side':<10} {'Entry':>8} {'Exit':>8} {'P&L':>10} {'Z':>6}  Entry Time")
-    print("-" * 80)
+    print(f"{'#':<4} {'Side':<18} {'Entry':>8} {'Exit':>8} {'P&L':>10} {'Z':>6}  Entry Time")
+    print("-" * 88)
     for i, t in enumerate(trades, 1):
-        print(f"{i:<4} {t['side']:<10} {t['entry_price']:>8.2f} {t['exit_price']:>8.2f} {t['pnl']:>+10.4f} {t['z_entry']:>6.2f}  {t['entry_time']}")
+        print(f"{i:<4} {t['side']:<18} {t['entry_price']:>8.2f} {t['exit_price']:>8.2f} {t['pnl']:>+10.4f} {t['z_entry']:>6.2f}  {t['entry_time']}")
 
 
 if __name__ == "__main__":

@@ -4,15 +4,11 @@ import socket
 import requests
 import pandas as pd
 import json
-import subprocess
-import atexit
 import os
 import re
 import sqlite3
 import numpy as np
 from obi_engine import calculate_obi
-
-tor_process = None
 
 
 def init_db():
@@ -35,22 +31,6 @@ def init_db():
     conn.commit()
     return conn
 
-def cleanup():
-    global tor_process
-    print("\n[SYSTEM] Shutting down Tor tunnel...")
-    if tor_process:
-        tor_process.terminate()
-    os.system("killall tor 2>/dev/null")
-
-atexit.register(cleanup)
-
-def start_tor():
-    global tor_process
-    print("[SYSTEM] Starting Tor tunnel in background...")
-    os.system("killall tor 2>/dev/null")
-    tor_process = subprocess.Popen(['tor'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print("[SYSTEM] Waiting 10 seconds for secure connection...")
-    time.sleep(10)
 
 def get_binance_obi(symbol):
     if '_' in symbol:
@@ -89,13 +69,33 @@ def extract_strike_price(text):
     numbers = [float(m.replace(',', '')) for m in matches]
     return max(numbers)
 
-def fetch_active_token(slug, url, proxies, headers, current_spot_price):
+def find_current_event_slug(base_slug, headers=None):
+    """Find the current active event slug by checking the current time slot and up to 3 previous slots."""
+    current_time = int(time.time())
+    current_slot = (current_time // 300) * 300
+    for offset in [0, -300, -600, -900]:
+        slot = current_slot + offset
+        slug = f"{base_slug}-{slot}"
+        try:
+            resp = requests.get(f"https://gamma-api.polymarket.com/events?slug={slug}", headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    markets = data[0].get('markets', [])
+                    active_markets = [m for m in markets if not m.get('closed', False) and m.get('active', True)]
+                    if active_markets:
+                        return slug
+        except Exception:
+            pass
+    return None
+
+def fetch_active_token(slug, url, headers, current_spot_price):
     """Fetch the best active market token. Returns (question, token_yes, token_no) or (None, None, None)."""
     try:
         resp = requests.get(
             f"https://gamma-api.polymarket.com/events?slug={slug}" if "/event/" in url
             else f"https://gamma-api.polymarket.com/markets?slug={slug}",
-            proxies=proxies, headers=headers, timeout=10
+            headers=headers, timeout=10
         )
         markets = resp.json()[0].get('markets', []) if "/event/" in url else resp.json()
 
@@ -108,7 +108,7 @@ def fetch_active_token(slug, url, proxies, headers, current_spot_price):
                 continue
             parsed = json.loads(clobs) if isinstance(clobs, str) else clobs
             if len(parsed) >= 2:
-                market_list.append((m.get('question'), parsed[0], parsed[1]))
+                market_list.append((m.get('question'), parsed[1], parsed[0]))
 
         if not market_list:
             return None, None, None
@@ -119,11 +119,50 @@ def fetch_active_token(slug, url, proxies, headers, current_spot_price):
             if strike and abs(strike - current_spot_price) < min_distance:
                 min_distance, best_idx = abs(strike - current_spot_price), i
 
+        if min_distance == float('inf'):
+            import datetime
+            past_markets = []
+            future_markets = []
+            now_utc = datetime.datetime.utcnow()
+            pattern = r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{1,2})[,\s]+(\d{1,2}):(\d{2})\s*(AM|PM)'
+            months = {
+                'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+                'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
+            }
+            for i, m in enumerate(market_list):
+                match = re.search(pattern, m[0], re.IGNORECASE)
+                if match:
+                    month_str, day_str, hour_str, minute_str, am_pm = match.groups()
+                    try:
+                        month = months[month_str.lower()[:3]]
+                        day = int(day_str)
+                        hour = int(hour_str)
+                        minute = int(minute_str)
+                        if am_pm.upper() == 'PM' and hour < 12:
+                            hour += 12
+                        elif am_pm.upper() == 'AM' and hour == 12:
+                            hour = 0
+                        dt_est = datetime.datetime(now_utc.year, month, day, hour, minute)
+                        # ET = UTC - 4 hours => UTC = ET + 4 hours
+                        dt_utc = dt_est + datetime.timedelta(hours=4)
+                        if dt_utc <= now_utc:
+                            past_markets.append((dt_utc, i))
+                        else:
+                            future_markets.append((dt_utc, i))
+                    except (ValueError, KeyError):
+                        pass
+            if past_markets:
+                best_idx = max(past_markets, key=lambda x: x[0])[1]
+            elif future_markets:
+                best_idx = min(future_markets, key=lambda x: x[0])[1]
+            else:
+                best_idx = len(market_list) - 1
+
         question, token_yes, token_no = market_list[best_idx]
         if min_distance < float('inf'):
             print(f"\n[ATM TARGET] {question} | Distance: {min_distance:.2f}")
         else:
-            print(f"\n[FALLBACK] No strike prices found — using first active market: {question}")
+            print(f"\n[FALLBACK] No strike prices found — using parsed/latest active market: {question}")
 
         return question, token_yes, token_no
     except Exception as e:
@@ -157,7 +196,6 @@ def send_executor_signal(token_id, side, price, size):
 
 def main():
     print(f"[SYSTEM] Kernel: {sys.version.split()[0]}")
-    start_tor()
     log_var = input("Start data logging ? Y(Yes)/N(No)\n")
     if log_var == "Y" or log_var == "y":
         print("Data logging enabled.")
@@ -167,7 +205,6 @@ def main():
         db_conn = None
         db_cursor = None
 
-    proxies = {'http': 'socks5h://127.0.0.1:9050', 'https': 'socks5h://127.0.0.1:9050'}
     headers = {'User-Agent': 'Mozilla/5.0'}
 
     url = input("\nEnter Polymarket URL: ").strip()
@@ -182,7 +219,20 @@ def main():
 
     slug = url.rstrip('/').split('/')[-1].split('?')[0]
 
-    question, token_yes, token_no = fetch_active_token(slug, url, proxies, headers, current_spot_price)
+    is_updown = '-updown-5m-' in slug
+    question, token_yes, token_no = None, None, None
+
+    if not is_updown:
+        question, token_yes, token_no = fetch_active_token(slug, url, headers, current_spot_price)
+
+    if is_updown or token_yes is None:
+        base_slug = re.sub(r'-\d+$', '', slug)
+        active_slug = find_current_event_slug(base_slug, headers)
+        if active_slug:
+            slug = active_slug
+            url = f"https://polymarket.com/event/{slug}" if "/event/" in url else f"https://polymarket.com/market/{slug}"
+            question, token_yes, token_no = fetch_active_token(slug, url, headers, current_spot_price)
+
     if token_yes is None:
         print("[ERROR] No active market found.")
         return
@@ -190,31 +240,58 @@ def main():
     alpha, ema_binance, spread_history = 0.125, None, []
     empty_book_streak = 0
     in_trade = False
+    obi_trad_raw = 0
+    obi_pm = 0
+    divergence = 0
+    z_score = 0
+    best_bid = 0
+    best_ask = 0
 
     if db_cursor is not None:
         print(f"[DATA LOGGER ACTIVE] Recording data to market_data.db...")
 
     while True:
         try:
-            resp_pm = requests.get(f"https://clob.polymarket.com/book?token_id={token_yes}", proxies=proxies, headers=headers, timeout=5)
+            resp_pm = requests.get(f"https://clob.polymarket.com/book?token_id={token_yes}", headers=headers, timeout=5)
             book_pm = resp_pm.json()
             bids_pm, asks_pm = pd.DataFrame(book_pm.get('bids', [])), pd.DataFrame(book_pm.get('asks', []))
             
+            price_col = 'price' if not bids_pm.empty and 'price' in bids_pm.columns else 0
+            size_col = 'size' if not bids_pm.empty and 'size' in bids_pm.columns else 1
+            
             # SYMMETRIC EXTRACTION: Cut to the top 5 levels for Polymarket too
-            v_b_pm = bids_pm.head(5)['size'].astype(float).sum() if not bids_pm.empty else 0
-            v_a_pm = asks_pm.head(5)['size'].astype(float).sum() if not asks_pm.empty else 0
+            v_b_pm = bids_pm.head(5)[size_col].astype(float).sum() if not bids_pm.empty else 0
+            v_a_pm = asks_pm.head(5)[size_col].astype(float).sum() if not asks_pm.empty else 0
 
             # Market rotation detection for expiring markets (e.g. BTC Up/Down 5m)
             if v_b_pm == 0 and v_a_pm == 0:
                 empty_book_streak += 1
                 if empty_book_streak >= 2:
+                    if in_trade:
+                        in_trade = False
+                        if db_cursor is not None:
+                            db_cursor.execute(
+                                "INSERT INTO spread_log (ticker, binance_obi_raw, binance_ema, polymarket_obi, spread, z_score, pm_best_bid, pm_best_ask, order_id, fill_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score, best_bid, best_ask, None, 'expired'))
+                            db_conn.commit()
+                        print(f"\n[MARKET EXPIRED] Position force-closed on market rotation")
                     current_spot_price = get_binance_price(ticker) or current_spot_price
-                    new_q, new_yes, new_no = fetch_active_token(slug, url, proxies, headers, current_spot_price)
+                    is_updown = '-updown-5m-' in slug
+                    new_q, new_yes, new_no = None, None, None
+                    if not is_updown:
+                        new_q, new_yes, new_no = fetch_active_token(slug, url, headers, current_spot_price)
+                    if is_updown or new_yes is None:
+                        base_slug = re.sub(r'-\d+$', '', slug)
+                        active_slug = find_current_event_slug(base_slug, headers)
+                        if active_slug:
+                            slug = active_slug
+                            url = f"https://polymarket.com/event/{slug}" if "/event/" in url else f"https://polymarket.com/market/{slug}"
+                            new_q, new_yes, new_no = fetch_active_token(slug, url, headers, current_spot_price)
                     if new_yes is not None:
                         question, token_yes, token_no = new_q, new_yes, new_no
                         print(f"\n[MARKET ROTATION] New target: {question}")
                     empty_book_streak = 0
-                    time.sleep(0.5)
+                    time.sleep(0.2)
                     continue
             else:
                 empty_book_streak = 0
@@ -222,8 +299,8 @@ def main():
             obi_pm = calculate_obi(pd.DataFrame({"bid_size": [v_b_pm], "ask_size": [v_a_pm]})) if (v_b_pm + v_a_pm) > 0 else 0
 
             # Extract best bid/ask for logging and order pricing
-            best_bid = float(bids_pm.iloc[0]['price']) if not bids_pm.empty else 0
-            best_ask = float(asks_pm.iloc[0]['price']) if not asks_pm.empty else 0
+            best_bid = float(bids_pm.iloc[0][price_col]) if not bids_pm.empty else 0
+            best_ask = float(asks_pm.iloc[0][price_col]) if not asks_pm.empty else 0
 
             obi_trad_raw = get_binance_obi(symbol=ticker)
             ema_binance = obi_trad_raw if ema_binance is None else (obi_trad_raw * alpha) + (ema_binance * (1 - alpha))
@@ -257,10 +334,11 @@ def main():
                         direction = "SELL (PM Overpriced)"
                         # Fetch token_no book for its best ask
                         try:
-                            resp_no = requests.get(f"https://clob.polymarket.com/book?token_id={token_no}", proxies=proxies, headers=headers, timeout=5)
+                            resp_no = requests.get(f"https://clob.polymarket.com/book?token_id={token_no}", headers=headers, timeout=5)
                             book_no = resp_no.json()
                             asks_no = pd.DataFrame(book_no.get('asks', []))
-                            best_ask_no = float(asks_no.iloc[0]['price']) if not asks_no.empty else 0
+                            price_col_no = 'price' if not asks_no.empty and 'price' in asks_no.columns else 0
+                            best_ask_no = float(asks_no.iloc[0][price_col_no]) if not asks_no.empty else 0
                         except Exception:
                             best_ask_no = 0
                         sig_price = round(best_ask_no - 0.01, 2)
@@ -278,13 +356,13 @@ def main():
                 db_conn.commit()
 
             print(f"Logging... Z-Score: {z_score:.2f} | Spread: {divergence:.4f}      ", end="\r", flush=True)
-            time.sleep(0.5)
+            time.sleep(0.2)
 
         except KeyboardInterrupt:
             break
         except Exception as e:
             print(f"[ERROR] Engine Failure: {e}")
-            time.sleep(0.5)
+            time.sleep(0.2)
             continue
 
 if __name__ == "__main__":
