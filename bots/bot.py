@@ -69,6 +69,18 @@ def extract_strike_price(text):
     numbers = [float(m.replace(',', '')) for m in matches]
     return max(numbers)
 
+def get_pm_amm_price(token_id, headers):
+    """Call CLOB price endpoint and return the float price, or 0.0 on error."""
+    url = f"https://clob.polymarket.com/price?token_id={token_id}&side=buy"
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            return float(data.get('price', 0.0))
+    except Exception:
+        pass
+    return 0.0
+
 def find_current_event_slug(base_slug, headers=None):
     """Find the current active event slug by checking the current time slot and up to 3 previous slots."""
     current_time = int(time.time())
@@ -170,10 +182,13 @@ def fetch_active_token(slug, url, headers, current_spot_price):
         return None, None, None
 
 
-def send_executor_signal(token_id, side, price, size):
+def send_executor_signal(token_id, side, price, size, order_type=None):
     """Send a trade signal to the C++ executor via TCP. Returns (order_id, status) or (None, None)."""
     try:
-        sig = json.dumps({"token_id": token_id, "side": side, "price": price, "size": size}) + "\n"
+        payload = {"token_id": token_id, "side": side, "price": price, "size": size}
+        if order_type:
+            payload["order_type"] = order_type
+        sig = json.dumps(payload) + "\n"
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(10)
         s.connect(("127.0.0.1", 9999))
@@ -218,6 +233,7 @@ def main():
     if current_spot_price is None: return
 
     slug = url.rstrip('/').split('/')[-1].split('?')[0]
+    is_5min_market = '-updown-5m-' in slug
 
     is_updown = '-updown-5m-' in slug
     question, token_yes, token_no = None, None, None
@@ -246,6 +262,7 @@ def main():
     z_score = 0
     best_bid = 0
     best_ask = 0
+    amm_price = 0.0
 
     if db_cursor is not None:
         print(f"[DATA LOGGER ACTIVE] Recording data to market_data.db...")
@@ -258,10 +275,12 @@ def main():
             
             price_col = 'price' if not bids_pm.empty and 'price' in bids_pm.columns else 0
             size_col = 'size' if not bids_pm.empty and 'size' in bids_pm.columns else 1
+            price_col_ask = 'price' if not asks_pm.empty and 'price' in asks_pm.columns else 0
+            size_col_ask = 'size' if not asks_pm.empty and 'size' in asks_pm.columns else 1
             
             # SYMMETRIC EXTRACTION: Cut to the top 5 levels for Polymarket too
             v_b_pm = bids_pm.head(5)[size_col].astype(float).sum() if not bids_pm.empty else 0
-            v_a_pm = asks_pm.head(5)[size_col].astype(float).sum() if not asks_pm.empty else 0
+            v_a_pm = asks_pm.head(5)[size_col_ask].astype(float).sum() if not asks_pm.empty else 0
 
             # Market rotation detection for expiring markets (e.g. BTC Up/Down 5m)
             if v_b_pm == 0 and v_a_pm == 0:
@@ -299,8 +318,13 @@ def main():
             obi_pm = calculate_obi(pd.DataFrame({"bid_size": [v_b_pm], "ask_size": [v_a_pm]})) if (v_b_pm + v_a_pm) > 0 else 0
 
             # Extract best bid/ask for logging and order pricing
-            best_bid = float(bids_pm.iloc[0][price_col]) if not bids_pm.empty else 0
-            best_ask = float(asks_pm.iloc[0][price_col]) if not asks_pm.empty else 0
+            if is_5min_market:
+                amm_price = get_pm_amm_price(token_yes, headers)
+                best_bid = amm_price
+                best_ask = amm_price
+            else:
+                best_bid = float(bids_pm.iloc[0][price_col]) if not bids_pm.empty else 0
+                best_ask = float(asks_pm.iloc[0][price_col_ask]) if not asks_pm.empty else 0
 
             obi_trad_raw = get_binance_obi(symbol=ticker)
             ema_binance = obi_trad_raw if ema_binance is None else (obi_trad_raw * alpha) + (ema_binance * (1 - alpha))
@@ -328,21 +352,29 @@ def main():
                     in_trade = True
                     if z_score > 0:
                         direction = "BUY (PM Underpriced)"
-                        sig_price = round(best_ask - 0.01, 2)
-                        order_id, fill_status = send_executor_signal(token_yes, "BUY", sig_price, 10)
+                        if is_5min_market:
+                            sig_price = amm_price
+                            order_id, fill_status = send_executor_signal(token_yes, "BUY", sig_price, 10, order_type="MARKET")
+                        else:
+                            sig_price = round(best_ask - 0.01, 2)
+                            order_id, fill_status = send_executor_signal(token_yes, "BUY", sig_price, 10)
                     else:
                         direction = "SELL (PM Overpriced)"
-                        # Fetch token_no book for its best ask
-                        try:
-                            resp_no = requests.get(f"https://clob.polymarket.com/book?token_id={token_no}", headers=headers, timeout=5)
-                            book_no = resp_no.json()
-                            asks_no = pd.DataFrame(book_no.get('asks', []))
-                            price_col_no = 'price' if not asks_no.empty and 'price' in asks_no.columns else 0
-                            best_ask_no = float(asks_no.iloc[0][price_col_no]) if not asks_no.empty else 0
-                        except Exception:
-                            best_ask_no = 0
-                        sig_price = round(best_ask_no - 0.01, 2)
-                        order_id, fill_status = send_executor_signal(token_no, "BUY", sig_price, 10)
+                        if is_5min_market:
+                            sig_price = get_pm_amm_price(token_no, headers)
+                            order_id, fill_status = send_executor_signal(token_no, "BUY", sig_price, 10, order_type="MARKET")
+                        else:
+                            # Fetch token_no book for its best ask
+                            try:
+                                resp_no = requests.get(f"https://clob.polymarket.com/book?token_id={token_no}", headers=headers, timeout=5)
+                                book_no = resp_no.json()
+                                asks_no = pd.DataFrame(book_no.get('asks', []))
+                                price_col_no = 'price' if not asks_no.empty and 'price' in asks_no.columns else 0
+                                best_ask_no = float(asks_no.iloc[0][price_col_no]) if not asks_no.empty else 0
+                            except Exception:
+                                best_ask_no = 0
+                            sig_price = round(best_ask_no - 0.01, 2)
+                            order_id, fill_status = send_executor_signal(token_no, "BUY", sig_price, 10)
                     print(f"\n TRIGGER! Z-Score: {z_score:.2f} | {direction} | Spread: {divergence:.4f} | Order: {fill_status}")
 
                 elif in_trade and abs(z_score) < 0.5:
@@ -362,6 +394,8 @@ def main():
             break
         except Exception as e:
             print(f"[ERROR] Engine Failure: {e}")
+            import traceback
+            traceback.print_exc()
             time.sleep(0.2)
             continue
 

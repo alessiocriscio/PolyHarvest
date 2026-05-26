@@ -573,7 +573,11 @@ public:
                        {"signature", sig_hex},
                        {"expiration", "0"},
                        {"taker", "0x0000000000000000000000000000000000000000"}};
-      body["orderType"] = "GTC";
+      std::string clob_order_type = "GTC";
+      if (sig.contains("order_type") && sig.at("order_type").get<std::string>() == "MARKET") {
+        clob_order_type = "FOK";
+      }
+      body["orderType"] = clob_order_type;
       body["tokenID"] = token_id;
 
       std::string body_str = body.dump();
