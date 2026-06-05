@@ -1,13 +1,15 @@
 import sys
 import time
 import socket
-import requests
+import aiohttp
+import asyncio
 import pandas as pd
 import json
 import os
 import re
 import sqlite3
 import numpy as np
+import datetime
 from obi_engine import calculate_obi
 
 
@@ -33,36 +35,43 @@ def init_db():
     return conn
 
 
-def get_binance_obi(symbol):
+async def get_binance_obi(session, symbol):
     if '_' in symbol:
         url = f"https://dapi.binance.com/dapi/v1/depth?symbol={symbol}&limit=10"
     else:
         url = f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=10"
     try:
-        resp = requests.get(url, timeout=3)
-        data = resp.json()
-        bids = pd.DataFrame(data.get('bids', []), columns=['price', 'bid_size']).astype(float)
-        asks = pd.DataFrame(data.get('asks', []), columns=['price', 'ask_size']).astype(float)
-        
-        # SYMMETRIC EXTRACTION: Cut to the top 5 levels of real liquidity
-        vol_bids = bids.head(5)['bid_size'].sum() if not bids.empty else 0
-        vol_asks = asks.head(5)['ask_size'].sum() if not asks.empty else 0
-        
-        df = pd.DataFrame({"bid_size": [vol_bids], "ask_size": [vol_asks]})
-        return calculate_obi(df) if (vol_bids + vol_asks) > 0 else 0
+        async with session.get(url, timeout=3) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                bids = pd.DataFrame(data.get('bids', []), columns=['price', 'bid_size']).astype(float)
+                asks = pd.DataFrame(data.get('asks', []), columns=['price', 'ask_size']).astype(float)
+                
+                # SYMMETRIC EXTRACTION: Cut to the top 5 levels of real liquidity
+                vol_bids = bids.head(5)['bid_size'].sum() if not bids.empty else 0
+                vol_asks = asks.head(5)['ask_size'].sum() if not asks.empty else 0
+                
+                df = pd.DataFrame({"bid_size": [vol_bids], "ask_size": [vol_asks]})
+                return calculate_obi(df) if (vol_bids + vol_asks) > 0 else 0
     except Exception:
-        return 0
+        pass
+    return 0
 
-def get_binance_price(symbol):
+
+async def get_binance_price(session, symbol):
     if '_' in symbol:
         url = f"https://dapi.binance.com/dapi/v1/ticker/price?symbol={symbol}"
     else:
         url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
     try:
-        resp = requests.get(url, timeout=3)
-        return float(resp.json()[0]['price']) if '_' in symbol else float(resp.json()['price'])
+        async with session.get(url, timeout=3) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return float(data[0]['price']) if '_' in symbol else float(data['price'])
     except Exception:
-        return None
+        pass
+    return None
+
 
 def extract_strike_price(text):
     matches = re.findall(r'\b\d{1,3}(?:,\d{3})*(?:\.\d+)?\b', text)
@@ -70,46 +79,87 @@ def extract_strike_price(text):
     numbers = [float(m.replace(',', '')) for m in matches]
     return max(numbers)
 
-def get_market_end_time(slug, headers):
+
+async def get_market_end_time(session, slug, headers):
     """Fetch endDate of the first active market for the given event slug."""
     try:
         url = f"https://gamma-api.polymarket.com/events?slug={slug}"
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            if isinstance(data, list) and len(data) > 0:
-                markets = data[0].get('markets', [])
-                active_markets = [m for m in markets if not m.get('closed', False) and m.get('active', True)]
-                if active_markets:
-                    end_date_str = active_markets[0].get('endDate')
-                    if end_date_str:
-                        import datetime
-                        clean_str = end_date_str.replace('Z', '').split('.')[0]
-                        return datetime.datetime.fromisoformat(clean_str)
+        async with session.get(url, headers=headers, timeout=10) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    markets = data[0].get('markets', [])
+                    active_markets = [m for m in markets if not m.get('closed', False) and m.get('active', True)]
+                    if active_markets:
+                        end_date_str = active_markets[0].get('endDate')
+                        if end_date_str:
+                            clean_str = end_date_str.replace('Z', '').split('.')[0]
+                            return datetime.datetime.fromisoformat(clean_str)
     except Exception:
         pass
     return None
 
-def get_pm_prices(token_yes, token_no, headers):
+
+async def get_market_volume(session, slug, headers):
+    """Fetch volume24hr of the first active market for the given event slug."""
+    try:
+        url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+        async with session.get(url, headers=headers, timeout=10) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    markets = data[0].get('markets', [])
+                    active_markets = [m for m in markets if not m.get('closed', False) and m.get('active', True)]
+                    if active_markets:
+                        volume_str = active_markets[0].get('volume24hr')
+                        if volume_str is not None:
+                            return float(volume_str)
+    except Exception:
+        pass
+    return 0.0
+
+
+async def get_pm_prices(session, token_yes, token_no, headers):
     """Retrieve ask_yes, bid_yes, and ask_no from CLOB price endpoints. Returns (bid_yes, ask_yes, ask_no)."""
     try:
         url_ask_yes = f"https://clob.polymarket.com/price?token_id={token_yes}&side=BUY"
         url_bid_yes = f"https://clob.polymarket.com/price?token_id={token_yes}&side=SELL"
         url_ask_no = f"https://clob.polymarket.com/price?token_id={token_no}&side=BUY"
         
-        resp_ask_yes = requests.get(url_ask_yes, headers=headers, timeout=5)
-        resp_bid_yes = requests.get(url_bid_yes, headers=headers, timeout=5)
-        resp_ask_no = requests.get(url_ask_no, headers=headers, timeout=5)
-        
-        ask_yes = float(resp_ask_yes.json().get('price', 0.0)) if resp_ask_yes.status_code == 200 else 0.0
-        bid_yes = float(resp_bid_yes.json().get('price', 0.0)) if resp_bid_yes.status_code == 200 else 0.0
-        ask_no = float(resp_ask_no.json().get('price', 0.0)) if resp_ask_no.status_code == 200 else 0.0
+        async def fetch_price(url):
+            try:
+                async with session.get(url, headers=headers, timeout=5) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        return float(data.get('price', 0.0))
+            except Exception:
+                pass
+            return 0.0
+
+        ask_yes, bid_yes, ask_no = await asyncio.gather(
+            fetch_price(url_ask_yes),
+            fetch_price(url_bid_yes),
+            fetch_price(url_ask_no)
+        )
         
         return bid_yes, ask_yes, ask_no
     except Exception:
         return 0.0, 0.0, 0.0
 
-def find_current_event_slug(base_slug, headers=None):
+
+async def get_pm_book(session, token_id, headers):
+    """Fetch CLOB orderbook for a token."""
+    try:
+        url = f"https://clob.polymarket.com/book?token_id={token_id}"
+        async with session.get(url, headers=headers, timeout=5) as resp:
+            if resp.status == 200:
+                return await resp.json()
+    except Exception:
+        pass
+    return {}
+
+
+async def find_current_event_slug(session, base_slug, headers=None):
     """Find the current active event slug by checking the current time slot and up to 3 previous slots."""
     current_time = int(time.time())
     current_slot = (current_time // 300) * 300
@@ -117,28 +167,34 @@ def find_current_event_slug(base_slug, headers=None):
         slot = current_slot + offset
         slug = f"{base_slug}-{slot}"
         try:
-            resp = requests.get(f"https://gamma-api.polymarket.com/events?slug={slug}", headers=headers, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list) and len(data) > 0:
-                    markets = data[0].get('markets', [])
-                    active_markets = [m for m in markets if not m.get('closed', False) and m.get('active', True)]
-                    if active_markets:
-                        return slug
+            url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+            async with session.get(url, headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        markets = data[0].get('markets', [])
+                        active_markets = [m for m in markets if not m.get('closed', False) and m.get('active', True)]
+                        if active_markets:
+                            return slug
         except Exception:
             pass
     return None
 
-def fetch_active_token(slug, url, headers, current_spot_price):
+
+async def fetch_active_token(session, slug, url, headers, current_spot_price):
     """Fetch the best active market token. Returns (question, token_yes, token_no) or (None, None, None)."""
     try:
-        resp = requests.get(
+        req_url = (
             f"https://gamma-api.polymarket.com/events?slug={slug}" if "/event/" in url
-            else f"https://gamma-api.polymarket.com/markets?slug={slug}",
-            headers=headers, timeout=10
+            else f"https://gamma-api.polymarket.com/markets?slug={slug}"
         )
-        markets = resp.json()[0].get('markets', []) if "/event/" in url else resp.json()
-
+        async with session.get(req_url, headers=headers, timeout=10) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                markets = data[0].get('markets', []) if "/event/" in url else data
+            else:
+                markets = []
+        
         market_list = []
         for m in markets:
             if m.get('closed', False) or not m.get('active', True):
@@ -234,7 +290,10 @@ def send_executor_signal(token_id, side, price, size):
         return None, None
 
 
-def main():
+async def main():
+    MIN_MARKET_VOLUME = 1000.0
+    MAX_Z_CIRCUIT_BREAKER = 7.0
+
     print(f"[SYSTEM] Kernel: {sys.version.split()[0]}")
     log_var = input("Start data logging ? Y(Yes)/N(No)\n")
     if log_var == "Y" or log_var == "y":
@@ -254,93 +313,78 @@ def main():
     except ValueError:
         z_threshold = 2.0
 
-    current_spot_price = get_binance_price(ticker)
-    if current_spot_price is None: return
+    try:
+        capital = float(input("Enter total capital in USD (e.g. 25.0): "))
+    except ValueError:
+        capital = 25.0
 
-    slug = url.rstrip('/').split('/')[-1].split('?')[0]
+    try:
+        trade_size_pct = float(input("Enter trade size % of capital (e.g. 5 for 5%): "))
+    except ValueError:
+        trade_size_pct = 5.0
 
-    is_updown = '-updown-5m-' in slug
-    question, token_yes, token_no = None, None, None
+    try:
+        max_daily_loss_pct = float(input("Enter max daily loss % of capital (e.g. 20 for 20%): "))
+    except ValueError:
+        max_daily_loss_pct = 20.0
 
-    if not is_updown:
-        question, token_yes, token_no = fetch_active_token(slug, url, headers, current_spot_price)
+    TRADE_SIZE = capital * trade_size_pct / 100
+    MAX_DAILY_LOSS = capital * max_daily_loss_pct / 100
 
-    if is_updown or token_yes is None:
-        base_slug = re.sub(r'-\d+$', '', slug)
-        active_slug = find_current_event_slug(base_slug, headers)
-        if active_slug:
-            slug = active_slug
-            url = f"https://polymarket.com/event/{slug}" if "/event/" in url else f"https://polymarket.com/market/{slug}"
-            question, token_yes, token_no = fetch_active_token(slug, url, headers, current_spot_price)
+    async with aiohttp.ClientSession() as session:
+        current_spot_price = await get_binance_price(session, ticker)
+        if current_spot_price is None: return
 
-    if token_yes is None:
-        print("[ERROR] No active market found.")
-        return
+        slug = url.rstrip('/').split('/')[-1].split('?')[0]
 
-    import datetime
-    market_end_time = get_market_end_time(slug, headers) or datetime.datetime.max
+        is_updown = '-updown-5m-' in slug
+        question, token_yes, token_no = None, None, None
 
-    alpha, ema_binance, spread_history = 0.125, None, []
-    empty_book_streak = 0
-    in_trade = False
-    obi_trad_raw = 0
-    obi_pm = 0
-    divergence = 0
-    z_score = 0
-    best_bid = 0
-    best_ask = 0
-    ask_no = 0.0
+        if not is_updown:
+            question, token_yes, token_no = await fetch_active_token(session, slug, url, headers, current_spot_price)
 
-    if db_cursor is not None:
-        print(f"[DATA LOGGER ACTIVE] Recording data to market_data.db...")
+        if is_updown or token_yes is None:
+            base_slug = re.sub(r'-\d+$', '', slug)
+            active_slug = await find_current_event_slug(session, base_slug, headers)
+            if active_slug:
+                slug = active_slug
+                url = f"https://polymarket.com/event/{slug}" if "/event/" in url else f"https://polymarket.com/market/{slug}"
+                question, token_yes, token_no = await fetch_active_token(session, slug, url, headers, current_spot_price)
 
-    while True:
-        try:
-            # Proactive market rotation based on expiry timer
-            if datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) >= market_end_time - datetime.timedelta(seconds=30):
-                if in_trade:
-                    in_trade = False
-                    if db_cursor is not None:
-                        db_cursor.execute(
-                            "INSERT INTO spread_log (ticker, binance_obi_raw, binance_ema, polymarket_obi, spread, z_score, pm_best_bid, pm_best_ask, pm_ask_no, order_id, fill_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score, best_bid, best_ask, ask_no, None, 'expired'))
-                        db_conn.commit()
-                    print(f"\n[MARKET EXPIRED] Position force-closed on proactive rotation")
-                
-                current_spot_price = get_binance_price(ticker) or current_spot_price
-                is_updown = '-updown-5m-' in slug
-                new_q, new_yes, new_no = None, None, None
-                if not is_updown:
-                    new_q, new_yes, new_no = fetch_active_token(slug, url, headers, current_spot_price)
-                if is_updown or new_yes is None:
-                    base_slug = re.sub(r'-\d+$', '', slug)
-                    active_slug = find_current_event_slug(base_slug, headers)
-                    if active_slug:
-                        slug = active_slug
-                        url = f"https://polymarket.com/event/{slug}" if "/event/" in url else f"https://polymarket.com/market/{slug}"
-                        new_q, new_yes, new_no = fetch_active_token(slug, url, headers, current_spot_price)
-                if new_yes is not None:
-                    question, token_yes, token_no = new_q, new_yes, new_no
-                    print(f"\n[PROACTIVE ROTATION] Market expires in <30s, switching now. New target: {question}")
-                    market_end_time = get_market_end_time(slug, headers) or datetime.datetime.max
-                empty_book_streak = 0
-                time.sleep(0.2)
-                continue
-            resp_pm = requests.get(f"https://clob.polymarket.com/book?token_id={token_yes}", headers=headers, timeout=5)
-            book_pm = resp_pm.json()
-            bids_pm, asks_pm = pd.DataFrame(book_pm.get('bids', [])), pd.DataFrame(book_pm.get('asks', []))
-            
-            size_col = 'size' if not bids_pm.empty and 'size' in bids_pm.columns else 1
-            size_col_ask = 'size' if not asks_pm.empty and 'size' in asks_pm.columns else 1
-            
-            # SYMMETRIC EXTRACTION: Cut to the top 5 levels for Polymarket too
-            v_b_pm = bids_pm.head(5)[size_col].astype(float).sum() if not bids_pm.empty else 0
-            v_a_pm = asks_pm.head(5)[size_col_ask].astype(float).sum() if not asks_pm.empty else 0
+        if token_yes is None:
+            print("[ERROR] No active market found.")
+            return
 
-            # Market rotation detection for expiring markets (e.g. BTC Up/Down 5m)
-            if v_b_pm == 0 and v_a_pm == 0:
-                empty_book_streak += 1
-                if empty_book_streak >= 2:
+        market_end_time = await get_market_end_time(session, slug, headers) or datetime.datetime.max
+
+        alpha, ema_binance, spread_history = 0.125, None, []
+        empty_book_streak = 0
+        in_trade = False
+        obi_trad_raw = 0
+        obi_pm = 0
+        divergence = 0
+        z_score = 0
+        best_bid = 0
+        best_ask = 0
+        ask_no = 0.0
+
+        daily_pnl = 0.0
+        daily_reset_date = datetime.date.today()
+        trade_direction = None
+        entry_price = 0.0
+
+        if db_cursor is not None:
+            print(f"[DATA LOGGER ACTIVE] Recording data to market_data.db...")
+
+        while True:
+            try:
+                # Daily reset check at start of each iteration
+                if datetime.date.today() != daily_reset_date:
+                    daily_pnl = 0.0
+                    daily_reset_date = datetime.date.today()
+
+                # Proactive market rotation based on expiry timer
+                if datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) >= market_end_time - datetime.timedelta(seconds=30):
                     if in_trade:
                         in_trade = False
                         if db_cursor is not None:
@@ -348,91 +392,169 @@ def main():
                                 "INSERT INTO spread_log (ticker, binance_obi_raw, binance_ema, polymarket_obi, spread, z_score, pm_best_bid, pm_best_ask, pm_ask_no, order_id, fill_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                 (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score, best_bid, best_ask, ask_no, None, 'expired'))
                             db_conn.commit()
-                        print(f"\n[MARKET EXPIRED] Position force-closed on market rotation")
-                    current_spot_price = get_binance_price(ticker) or current_spot_price
+                        print(f"\n[MARKET EXPIRED] Position force-closed on proactive rotation")
+                    
+                    current_spot_price = await get_binance_price(session, ticker) or current_spot_price
                     is_updown = '-updown-5m-' in slug
                     new_q, new_yes, new_no = None, None, None
                     if not is_updown:
-                        new_q, new_yes, new_no = fetch_active_token(slug, url, headers, current_spot_price)
+                        new_q, new_yes, new_no = await fetch_active_token(session, slug, url, headers, current_spot_price)
                     if is_updown or new_yes is None:
                         base_slug = re.sub(r'-\d+$', '', slug)
-                        active_slug = find_current_event_slug(base_slug, headers)
+                        active_slug = await find_current_event_slug(session, base_slug, headers)
                         if active_slug:
                             slug = active_slug
                             url = f"https://polymarket.com/event/{slug}" if "/event/" in url else f"https://polymarket.com/market/{slug}"
-                            new_q, new_yes, new_no = fetch_active_token(slug, url, headers, current_spot_price)
+                            new_q, new_yes, new_no = await fetch_active_token(session, slug, url, headers, current_spot_price)
                     if new_yes is not None:
                         question, token_yes, token_no = new_q, new_yes, new_no
-                        print(f"\n[MARKET ROTATION] New target: {question}")
-                        market_end_time = get_market_end_time(slug, headers) or datetime.datetime.max
+                        print(f"\n[PROACTIVE ROTATION] Market expires in <30s, switching now. New target: {question}")
+                        market_end_time = await get_market_end_time(session, slug, headers) or datetime.datetime.max
                     empty_book_streak = 0
-                    time.sleep(0.2)
+                    await asyncio.sleep(0.1)
                     continue
-            else:
-                empty_book_streak = 0
 
-            obi_pm = calculate_obi(pd.DataFrame({"bid_size": [v_b_pm], "ask_size": [v_a_pm]})) if (v_b_pm + v_a_pm) > 0 else 0
-
-            # Extract best bid/ask for logging and order pricing via /price endpoint
-            bid_yes, ask_yes, ask_no = get_pm_prices(token_yes, token_no, headers)
-            best_bid = bid_yes
-            best_ask = ask_yes
-
-            obi_trad_raw = get_binance_obi(symbol=ticker)
-            ema_binance = obi_trad_raw if ema_binance is None else (obi_trad_raw * alpha) + (ema_binance * (1 - alpha))
-
-            # DIRECTIONAL SPREAD: No abs() to maintain signal direction
-            divergence = ema_binance - obi_pm
-            
-            # ROLLING WINDOW: 80 samples
-            spread_history.append(divergence)
-            if len(spread_history) > 80: 
-                spread_history.pop(0)
-
-            z_score = 0
-            order_id = None
-            fill_status = None
-
-            if len(spread_history) == 80:
-                s_series = pd.Series(spread_history)
-                mean, std = s_series.mean(), s_series.std()
-                if std > 0: 
-                    z_score = (divergence - mean) / std
+                # Fetch Binance OBI, Polymarket book, and Polymarket prices concurrently
+                binance_obi_task = get_binance_obi(session, ticker)
+                pm_book_task = get_pm_book(session, token_yes, headers)
+                pm_prices_task = get_pm_prices(session, token_yes, token_no, headers)
                 
-                # SIGNAL TO EXECUTOR IF THRESHOLD IS BREACHED
-                if abs(z_score) > z_threshold and not in_trade:
-                    in_trade = True
-                    if z_score > 0:
-                        direction = "BUY (PM Underpriced)"
-                        sig_price = round(ask_yes - 0.01, 2)
-                        order_id, fill_status = send_executor_signal(token_yes, "BUY", sig_price, 10)
-                    else:
-                        direction = "SELL (PM Overpriced)"
-                        sig_price = round(ask_no - 0.01, 2)
-                        order_id, fill_status = send_executor_signal(token_no, "BUY", sig_price, 10)
-                    print(f"\n TRIGGER! Z-Score: {z_score:.2f} | {direction} | Spread: {divergence:.4f} | Order: {fill_status}")
+                obi_trad_raw, book_pm, pm_prices = await asyncio.gather(
+                    binance_obi_task,
+                    pm_book_task,
+                    pm_prices_task
+                )
+                bid_yes, ask_yes, ask_no = pm_prices
+                
+                bids_pm = pd.DataFrame(book_pm.get('bids', []))
+                asks_pm = pd.DataFrame(book_pm.get('asks', []))
+                
+                size_col = 'size' if not bids_pm.empty and 'size' in bids_pm.columns else 1
+                size_col_ask = 'size' if not asks_pm.empty and 'size' in asks_pm.columns else 1
+                
+                # SYMMETRIC EXTRACTION: Cut to the top 5 levels for Polymarket too
+                v_b_pm = bids_pm.head(5)[size_col].astype(float).sum() if not bids_pm.empty else 0
+                v_a_pm = asks_pm.head(5)[size_col_ask].astype(float).sum() if not asks_pm.empty else 0
 
-                elif in_trade and abs(z_score) < 0.5:
-                    in_trade = False
-                    print(f"\n[EXIT] Z-Score back to {z_score:.2f} | Position closed")
+                # Market rotation detection for expiring markets (e.g. BTC Up/Down 5m)
+                if v_b_pm == 0 and v_a_pm == 0:
+                    empty_book_streak += 1
+                    if empty_book_streak >= 2:
+                        if in_trade:
+                            in_trade = False
+                            if db_cursor is not None:
+                                db_cursor.execute(
+                                    "INSERT INTO spread_log (ticker, binance_obi_raw, binance_ema, polymarket_obi, spread, z_score, pm_best_bid, pm_best_ask, pm_ask_no, order_id, fill_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                    (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score, best_bid, best_ask, ask_no, None, 'expired'))
+                                db_conn.commit()
+                            print(f"\n[MARKET EXPIRED] Position force-closed on market rotation")
+                        current_spot_price = await get_binance_price(session, ticker) or current_spot_price
+                        is_updown = '-updown-5m-' in slug
+                        new_q, new_yes, new_no = None, None, None
+                        if not is_updown:
+                            new_q, new_yes, new_no = await fetch_active_token(session, slug, url, headers, current_spot_price)
+                        if is_updown or new_yes is None:
+                            base_slug = re.sub(r'-\d+$', '', slug)
+                            active_slug = await find_current_event_slug(session, base_slug, headers)
+                            if active_slug:
+                                slug = active_slug
+                                url = f"https://polymarket.com/event/{slug}" if "/event/" in url else f"https://polymarket.com/market/{slug}"
+                                new_q, new_yes, new_no = await fetch_active_token(session, slug, url, headers, current_spot_price)
+                        if new_yes is not None:
+                            question, token_yes, token_no = new_q, new_yes, new_no
+                            print(f"\n[MARKET ROTATION] New target: {question}")
+                            market_end_time = await get_market_end_time(session, slug, headers) or datetime.datetime.max
+                        empty_book_streak = 0
+                        await asyncio.sleep(0.1)
+                        continue
+                else:
+                    empty_book_streak = 0
 
-            if db_cursor is not None:
-                db_cursor.execute(
-                    "INSERT INTO spread_log (ticker, binance_obi_raw, binance_ema, polymarket_obi, spread, z_score, pm_best_bid, pm_best_ask, pm_ask_no, order_id, fill_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score, best_bid, best_ask, ask_no, order_id, fill_status))
-                db_conn.commit()
+                obi_pm = calculate_obi(pd.DataFrame({"bid_size": [v_b_pm], "ask_size": [v_a_pm]})) if (v_b_pm + v_a_pm) > 0 else 0
 
-            print(f"Logging... Z-Score: {z_score:.2f} | Spread: {divergence:.4f}      ", end="\r", flush=True)
-            time.sleep(0.2)
+                # Extract best bid/ask for logging and order pricing via /price endpoint
+                best_bid = bid_yes
+                best_ask = ask_yes
 
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            print(f"[ERROR] Engine Failure: {e}")
-            import traceback
-            traceback.print_exc()
-            time.sleep(0.2)
-            continue
+                ema_binance = obi_trad_raw if ema_binance is None else (obi_trad_raw * alpha) + (ema_binance * (1 - alpha))
+
+                # DIRECTIONAL SPREAD: No abs() to maintain signal direction
+                divergence = ema_binance - obi_pm
+                
+                # ROLLING WINDOW: 80 samples
+                spread_history.append(divergence)
+                if len(spread_history) > 80: 
+                    spread_history.pop(0)
+
+                z_score = 0
+                order_id = None
+                fill_status = None
+
+                if len(spread_history) == 80:
+                    s_series = pd.Series(spread_history)
+                    mean, std = s_series.mean(), s_series.std()
+                    if std > 0: 
+                        z_score = (divergence - mean) / std
+                    
+                    # SIGNAL TO EXECUTOR IF THRESHOLD IS BREACHED
+                    if abs(z_score) > z_threshold and not in_trade:
+                        # Risk validation checks
+                        if daily_pnl <= -MAX_DAILY_LOSS:
+                            print("\n[RISK] Daily loss limit reached, bot paused")
+                        elif abs(z_score) > MAX_Z_CIRCUIT_BREAKER:
+                            print("\n[RISK] Z-score anomaly, skipping")
+                        else:
+                            # Fetch market volume
+                            vol = await get_market_volume(session, slug, headers)
+                            if vol < MIN_MARKET_VOLUME:
+                                print(f"\n[RISK] Insufficient liquidity (volume: {vol:.2f} < {MIN_MARKET_VOLUME:.2f})")
+                            else:
+                                in_trade = True
+                                if z_score > 0:
+                                    direction = "BUY (PM Underpriced)"
+                                    sig_price = round(ask_yes - 0.01, 2)
+                                    trade_direction = "Yes"
+                                    entry_price = sig_price
+                                    order_id, fill_status = await asyncio.to_thread(send_executor_signal, token_yes, "BUY", sig_price, TRADE_SIZE)
+                                else:
+                                    direction = "SELL (PM Overpriced)"
+                                    sig_price = round(ask_no - 0.01, 2)
+                                    trade_direction = "No"
+                                    entry_price = sig_price
+                                    order_id, fill_status = await asyncio.to_thread(send_executor_signal, token_no, "BUY", sig_price, TRADE_SIZE)
+                                print(f"\n TRIGGER! Z-Score: {z_score:.2f} | {direction} | Spread: {divergence:.4f} | Order: {fill_status}")
+
+                    elif in_trade and abs(z_score) < 0.5:
+                        in_trade = False
+                        if trade_direction == "Yes":
+                            estimated_pnl = (best_bid - entry_price) * TRADE_SIZE
+                        else:
+                            estimated_pnl = (ask_no - entry_price) * TRADE_SIZE
+                        daily_pnl += estimated_pnl
+                        print(f"\n[EXIT] Z-Score back to {z_score:.2f} | Position closed | Estimated P&L: {estimated_pnl:+.4f} | Daily P&L: {daily_pnl:+.4f}")
+                        if abs(estimated_pnl) >= 0.01:
+                            capital += estimated_pnl
+                            TRADE_SIZE = capital * trade_size_pct / 100
+                            MAX_DAILY_LOSS = capital * max_daily_loss_pct / 100
+                            print(f"[CAPITAL] Updated capital: {capital:.4f} | New trade size: {TRADE_SIZE:.4f}")
+
+                if db_cursor is not None:
+                    db_cursor.execute(
+                        "INSERT INTO spread_log (ticker, binance_obi_raw, binance_ema, polymarket_obi, spread, z_score, pm_best_bid, pm_best_ask, pm_ask_no, order_id, fill_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score, best_bid, best_ask, ask_no, order_id, fill_status))
+                    db_conn.commit()
+
+                print(f"Logging... Z-Score: {z_score:.2f} | Spread: {divergence:.4f}      ", end="\r", flush=True)
+                await asyncio.sleep(0.1)
+
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                print(f"[ERROR] Engine Failure: {e}")
+                import traceback
+                traceback.print_exc()
+                await asyncio.sleep(0.1)
+                continue
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
