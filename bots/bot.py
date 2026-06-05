@@ -21,9 +21,10 @@ def init_db():
                   binance_ema REAL,
                   polymarket_obi REAL,
                   spread REAL,
-                  z_score REAL)''')
+                  z_score REAL,
+                  pm_ask_no REAL)''')
     # Migrate schema: add columns if missing (safe for existing DBs)
-    for col_def in ['pm_best_bid REAL', 'pm_best_ask REAL', 'order_id TEXT', 'fill_status TEXT']:
+    for col_def in ['pm_best_bid REAL', 'pm_best_ask REAL', 'order_id TEXT', 'fill_status TEXT', 'pm_ask_no REAL']:
         try:
             c.execute(f'ALTER TABLE spread_log ADD COLUMN {col_def}')
         except sqlite3.OperationalError:
@@ -69,17 +70,44 @@ def extract_strike_price(text):
     numbers = [float(m.replace(',', '')) for m in matches]
     return max(numbers)
 
-def get_pm_amm_price(token_id, headers):
-    """Call CLOB price endpoint and return the float price, or 0.0 on error."""
-    url = f"https://clob.polymarket.com/price?token_id={token_id}&side=buy"
+def get_market_end_time(slug, headers):
+    """Fetch endDate of the first active market for the given event slug."""
     try:
-        resp = requests.get(url, headers=headers, timeout=5)
+        url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+        resp = requests.get(url, headers=headers, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
-            return float(data.get('price', 0.0))
+            if isinstance(data, list) and len(data) > 0:
+                markets = data[0].get('markets', [])
+                active_markets = [m for m in markets if not m.get('closed', False) and m.get('active', True)]
+                if active_markets:
+                    end_date_str = active_markets[0].get('endDate')
+                    if end_date_str:
+                        import datetime
+                        clean_str = end_date_str.replace('Z', '').split('.')[0]
+                        return datetime.datetime.fromisoformat(clean_str)
     except Exception:
         pass
-    return 0.0
+    return None
+
+def get_pm_prices(token_yes, token_no, headers):
+    """Retrieve ask_yes, bid_yes, and ask_no from CLOB price endpoints. Returns (bid_yes, ask_yes, ask_no)."""
+    try:
+        url_ask_yes = f"https://clob.polymarket.com/price?token_id={token_yes}&side=BUY"
+        url_bid_yes = f"https://clob.polymarket.com/price?token_id={token_yes}&side=SELL"
+        url_ask_no = f"https://clob.polymarket.com/price?token_id={token_no}&side=BUY"
+        
+        resp_ask_yes = requests.get(url_ask_yes, headers=headers, timeout=5)
+        resp_bid_yes = requests.get(url_bid_yes, headers=headers, timeout=5)
+        resp_ask_no = requests.get(url_ask_no, headers=headers, timeout=5)
+        
+        ask_yes = float(resp_ask_yes.json().get('price', 0.0)) if resp_ask_yes.status_code == 200 else 0.0
+        bid_yes = float(resp_bid_yes.json().get('price', 0.0)) if resp_bid_yes.status_code == 200 else 0.0
+        ask_no = float(resp_ask_no.json().get('price', 0.0)) if resp_ask_no.status_code == 200 else 0.0
+        
+        return bid_yes, ask_yes, ask_no
+    except Exception:
+        return 0.0, 0.0, 0.0
 
 def find_current_event_slug(base_slug, headers=None):
     """Find the current active event slug by checking the current time slot and up to 3 previous slots."""
@@ -135,7 +163,7 @@ def fetch_active_token(slug, url, headers, current_spot_price):
             import datetime
             past_markets = []
             future_markets = []
-            now_utc = datetime.datetime.utcnow()
+            now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
             pattern = r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{1,2})[,\s]+(\d{1,2}):(\d{2})\s*(AM|PM)'
             months = {
                 'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
@@ -182,13 +210,10 @@ def fetch_active_token(slug, url, headers, current_spot_price):
         return None, None, None
 
 
-def send_executor_signal(token_id, side, price, size, order_type=None):
+def send_executor_signal(token_id, side, price, size):
     """Send a trade signal to the C++ executor via TCP. Returns (order_id, status) or (None, None)."""
     try:
-        payload = {"token_id": token_id, "side": side, "price": price, "size": size}
-        if order_type:
-            payload["order_type"] = order_type
-        sig = json.dumps(payload) + "\n"
+        sig = json.dumps({"token_id": token_id, "side": side, "price": price, "size": size}) + "\n"
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(10)
         s.connect(("127.0.0.1", 9999))
@@ -233,7 +258,6 @@ def main():
     if current_spot_price is None: return
 
     slug = url.rstrip('/').split('/')[-1].split('?')[0]
-    is_5min_market = '-updown-5m-' in slug
 
     is_updown = '-updown-5m-' in slug
     question, token_yes, token_no = None, None, None
@@ -253,6 +277,9 @@ def main():
         print("[ERROR] No active market found.")
         return
 
+    import datetime
+    market_end_time = get_market_end_time(slug, headers) or datetime.datetime.max
+
     alpha, ema_binance, spread_history = 0.125, None, []
     empty_book_streak = 0
     in_trade = False
@@ -262,20 +289,48 @@ def main():
     z_score = 0
     best_bid = 0
     best_ask = 0
-    amm_price = 0.0
+    ask_no = 0.0
 
     if db_cursor is not None:
         print(f"[DATA LOGGER ACTIVE] Recording data to market_data.db...")
 
     while True:
         try:
+            # Proactive market rotation based on expiry timer
+            if datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) >= market_end_time - datetime.timedelta(seconds=30):
+                if in_trade:
+                    in_trade = False
+                    if db_cursor is not None:
+                        db_cursor.execute(
+                            "INSERT INTO spread_log (ticker, binance_obi_raw, binance_ema, polymarket_obi, spread, z_score, pm_best_bid, pm_best_ask, pm_ask_no, order_id, fill_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score, best_bid, best_ask, ask_no, None, 'expired'))
+                        db_conn.commit()
+                    print(f"\n[MARKET EXPIRED] Position force-closed on proactive rotation")
+                
+                current_spot_price = get_binance_price(ticker) or current_spot_price
+                is_updown = '-updown-5m-' in slug
+                new_q, new_yes, new_no = None, None, None
+                if not is_updown:
+                    new_q, new_yes, new_no = fetch_active_token(slug, url, headers, current_spot_price)
+                if is_updown or new_yes is None:
+                    base_slug = re.sub(r'-\d+$', '', slug)
+                    active_slug = find_current_event_slug(base_slug, headers)
+                    if active_slug:
+                        slug = active_slug
+                        url = f"https://polymarket.com/event/{slug}" if "/event/" in url else f"https://polymarket.com/market/{slug}"
+                        new_q, new_yes, new_no = fetch_active_token(slug, url, headers, current_spot_price)
+                if new_yes is not None:
+                    question, token_yes, token_no = new_q, new_yes, new_no
+                    print(f"\n[PROACTIVE ROTATION] Market expires in <30s, switching now. New target: {question}")
+                    market_end_time = get_market_end_time(slug, headers) or datetime.datetime.max
+                empty_book_streak = 0
+                time.sleep(0.2)
+                continue
             resp_pm = requests.get(f"https://clob.polymarket.com/book?token_id={token_yes}", headers=headers, timeout=5)
             book_pm = resp_pm.json()
             bids_pm, asks_pm = pd.DataFrame(book_pm.get('bids', [])), pd.DataFrame(book_pm.get('asks', []))
             
-            price_col = 'price' if not bids_pm.empty and 'price' in bids_pm.columns else 0
             size_col = 'size' if not bids_pm.empty and 'size' in bids_pm.columns else 1
-            price_col_ask = 'price' if not asks_pm.empty and 'price' in asks_pm.columns else 0
             size_col_ask = 'size' if not asks_pm.empty and 'size' in asks_pm.columns else 1
             
             # SYMMETRIC EXTRACTION: Cut to the top 5 levels for Polymarket too
@@ -290,8 +345,8 @@ def main():
                         in_trade = False
                         if db_cursor is not None:
                             db_cursor.execute(
-                                "INSERT INTO spread_log (ticker, binance_obi_raw, binance_ema, polymarket_obi, spread, z_score, pm_best_bid, pm_best_ask, order_id, fill_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score, best_bid, best_ask, None, 'expired'))
+                                "INSERT INTO spread_log (ticker, binance_obi_raw, binance_ema, polymarket_obi, spread, z_score, pm_best_bid, pm_best_ask, pm_ask_no, order_id, fill_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score, best_bid, best_ask, ask_no, None, 'expired'))
                             db_conn.commit()
                         print(f"\n[MARKET EXPIRED] Position force-closed on market rotation")
                     current_spot_price = get_binance_price(ticker) or current_spot_price
@@ -309,6 +364,7 @@ def main():
                     if new_yes is not None:
                         question, token_yes, token_no = new_q, new_yes, new_no
                         print(f"\n[MARKET ROTATION] New target: {question}")
+                        market_end_time = get_market_end_time(slug, headers) or datetime.datetime.max
                     empty_book_streak = 0
                     time.sleep(0.2)
                     continue
@@ -317,14 +373,10 @@ def main():
 
             obi_pm = calculate_obi(pd.DataFrame({"bid_size": [v_b_pm], "ask_size": [v_a_pm]})) if (v_b_pm + v_a_pm) > 0 else 0
 
-            # Extract best bid/ask for logging and order pricing
-            if is_5min_market:
-                amm_price = get_pm_amm_price(token_yes, headers)
-                best_bid = amm_price
-                best_ask = amm_price
-            else:
-                best_bid = float(bids_pm.iloc[0][price_col]) if not bids_pm.empty else 0
-                best_ask = float(asks_pm.iloc[0][price_col_ask]) if not asks_pm.empty else 0
+            # Extract best bid/ask for logging and order pricing via /price endpoint
+            bid_yes, ask_yes, ask_no = get_pm_prices(token_yes, token_no, headers)
+            best_bid = bid_yes
+            best_ask = ask_yes
 
             obi_trad_raw = get_binance_obi(symbol=ticker)
             ema_binance = obi_trad_raw if ema_binance is None else (obi_trad_raw * alpha) + (ema_binance * (1 - alpha))
@@ -352,29 +404,12 @@ def main():
                     in_trade = True
                     if z_score > 0:
                         direction = "BUY (PM Underpriced)"
-                        if is_5min_market:
-                            sig_price = amm_price
-                            order_id, fill_status = send_executor_signal(token_yes, "BUY", sig_price, 10, order_type="MARKET")
-                        else:
-                            sig_price = round(best_ask - 0.01, 2)
-                            order_id, fill_status = send_executor_signal(token_yes, "BUY", sig_price, 10)
+                        sig_price = round(ask_yes - 0.01, 2)
+                        order_id, fill_status = send_executor_signal(token_yes, "BUY", sig_price, 10)
                     else:
                         direction = "SELL (PM Overpriced)"
-                        if is_5min_market:
-                            sig_price = get_pm_amm_price(token_no, headers)
-                            order_id, fill_status = send_executor_signal(token_no, "BUY", sig_price, 10, order_type="MARKET")
-                        else:
-                            # Fetch token_no book for its best ask
-                            try:
-                                resp_no = requests.get(f"https://clob.polymarket.com/book?token_id={token_no}", headers=headers, timeout=5)
-                                book_no = resp_no.json()
-                                asks_no = pd.DataFrame(book_no.get('asks', []))
-                                price_col_no = 'price' if not asks_no.empty and 'price' in asks_no.columns else 0
-                                best_ask_no = float(asks_no.iloc[0][price_col_no]) if not asks_no.empty else 0
-                            except Exception:
-                                best_ask_no = 0
-                            sig_price = round(best_ask_no - 0.01, 2)
-                            order_id, fill_status = send_executor_signal(token_no, "BUY", sig_price, 10)
+                        sig_price = round(ask_no - 0.01, 2)
+                        order_id, fill_status = send_executor_signal(token_no, "BUY", sig_price, 10)
                     print(f"\n TRIGGER! Z-Score: {z_score:.2f} | {direction} | Spread: {divergence:.4f} | Order: {fill_status}")
 
                 elif in_trade and abs(z_score) < 0.5:
@@ -383,8 +418,8 @@ def main():
 
             if db_cursor is not None:
                 db_cursor.execute(
-                    "INSERT INTO spread_log (ticker, binance_obi_raw, binance_ema, polymarket_obi, spread, z_score, pm_best_bid, pm_best_ask, order_id, fill_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score, best_bid, best_ask, order_id, fill_status))
+                    "INSERT INTO spread_log (ticker, binance_obi_raw, binance_ema, polymarket_obi, spread, z_score, pm_best_bid, pm_best_ask, pm_ask_no, order_id, fill_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score, best_bid, best_ask, ask_no, order_id, fill_status))
                 db_conn.commit()
 
             print(f"Logging... Z-Score: {z_score:.2f} | Spread: {divergence:.4f}      ", end="\r", flush=True)
