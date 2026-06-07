@@ -9,10 +9,16 @@ import sys
 
 DB_PATH = "market_data.db"
 try:
-    _user_input = input("Enter capital per trade in USD (default: 1.0): ").strip()
-    TRADE_SIZE = float(_user_input) if _user_input else 1.0
+    _cap_input = input("Enter total capital in USD (e.g. 25.0): ").strip()
+    capital = float(_cap_input) if _cap_input else 25.0
 except Exception:
-    TRADE_SIZE = 1.0
+    capital = 25.0
+
+try:
+    _pct_input = input("Enter trade size % of capital (e.g. 5 for 5%): ").strip()
+    trade_size_pct = float(_pct_input) if _pct_input else 5.0
+except Exception:
+    trade_size_pct = 5.0
 
 EXIT_Z_THRESHOLD = 0.5
 
@@ -60,7 +66,7 @@ def load_rows_from_csv(path):
     return rows
 
 
-def run_simulated_backtest(rows, trade_size, z_threshold):
+def run_simulated_backtest(rows, capital, trade_size_pct, z_threshold):
     """
     Simulated trading mode:
     - Scans rows chronologically.
@@ -76,7 +82,7 @@ def run_simulated_backtest(rows, trade_size, z_threshold):
     - Force exit: when fill_status = 'expired'
       - exit_price = 0.5
       - Mark as [EXPIRED]
-    - P&L per trade = (exit_price - entry_price) * trade_size + rebate
+    - P&L per trade = (exit_price - entry_price) * current_trade_size + rebate
     """
     trades = []
     in_trade = False
@@ -85,6 +91,7 @@ def run_simulated_backtest(rows, trade_size, z_threshold):
     is_buy_yes_val = True
     z_entry_val = 0.0
     skipped_extreme = 0
+    current_trade_size = capital * trade_size_pct / 100
 
     idx = 0
     while idx < len(rows):
@@ -117,12 +124,21 @@ def run_simulated_backtest(rows, trade_size, z_threshold):
                     r = rows[k]
                     r_bid = r.get("pm_best_bid") if r.get("pm_best_bid") is not None else 0.0
                     r_ask = r.get("pm_best_ask") if r.get("pm_best_ask") is not None else 0.0
+                    r_ask_no = r.get("pm_ask_no") if r.get("pm_ask_no") is not None else 0.0
                     
-                    bid_to_check = r_bid if is_buy_yes else (1.0 - r_ask)
-                    if bid_to_check <= entry_price:
-                        filled = True
-                        fill_idx = k
-                        break
+                    if is_buy_yes:
+                        # Correct Maker Execution for YES: market ASK must drop to or below our Buy Limit Price
+                        if r_ask > 0 and r_ask <= entry_price:
+                            filled = True
+                            fill_idx = k
+                            break
+                    else:
+                        # Correct Maker Execution for NO: market NO ASK must drop to or below our Buy Limit Price
+                        current_ask_no = r_ask_no if r_ask_no > 0 else round(1.0 - r_bid, 2)
+                        if current_ask_no > 0 and current_ask_no <= entry_price:
+                            filled = True
+                            fill_idx = k
+                            break
                 
                 if filled:
                     in_trade = True
@@ -140,8 +156,8 @@ def run_simulated_backtest(rows, trade_size, z_threshold):
             # Check for force exit
             if row.get("fill_status") == "expired":
                 exit_price = 0.5
-                rebate = entry_price_val * trade_size * 0.0036
-                pnl = (exit_price - entry_price_val) * trade_size + rebate
+                rebate = entry_price_val * current_trade_size * 0.0036
+                pnl = (exit_price - entry_price_val) * current_trade_size + rebate
                 trades.append({
                     "entry_time": entry_row["timestamp"],
                     "exit_time": row["timestamp"],
@@ -155,6 +171,9 @@ def run_simulated_backtest(rows, trade_size, z_threshold):
                 })
                 in_trade = False
                 idx += 1
+                if abs(pnl) >= 0.01:
+                    capital += pnl
+                    current_trade_size = capital * trade_size_pct / 100
             # Check for normal exit
             elif abs(z_score) < EXIT_Z_THRESHOLD:
                 pm_best_bid = row.get("pm_best_bid") if row.get("pm_best_bid") is not None else 0.0
@@ -162,8 +181,8 @@ def run_simulated_backtest(rows, trade_size, z_threshold):
                 
                 exit_price = pm_best_bid if is_buy_yes_val else 1.0 - pm_best_ask
                 exit_price = round(exit_price, 2)
-                rebate = entry_price_val * trade_size * 0.0036
-                pnl = (exit_price - entry_price_val) * trade_size + rebate
+                rebate = entry_price_val * current_trade_size * 0.0036
+                pnl = (exit_price - entry_price_val) * current_trade_size + rebate
                 trades.append({
                     "entry_time": entry_row["timestamp"],
                     "exit_time": row["timestamp"],
@@ -176,6 +195,9 @@ def run_simulated_backtest(rows, trade_size, z_threshold):
                 })
                 in_trade = False
                 idx += 1
+                if abs(pnl) >= 0.01:
+                    capital += pnl
+                    current_trade_size = capital * trade_size_pct / 100
             else:
                 idx += 1
 
@@ -183,7 +205,7 @@ def run_simulated_backtest(rows, trade_size, z_threshold):
         print(f"[BACKTEST] Open position at end of data: entry {entry_price_val} from {entry_row['timestamp']}")
 
     print(f"Skipped (extreme price): {skipped_extreme}")
-    return trades
+    return trades, capital
 
 
 def run_backtest():
@@ -204,6 +226,8 @@ def run_backtest():
     if not rows:
         print("[BACKTEST] No data found.")
         return
+
+    trade_size = capital * trade_size_pct / 100
 
     trades = []
     i = 0
@@ -230,11 +254,11 @@ def run_backtest():
 
             if is_buy_yes:
                 exit_price = exit_row["pm_best_bid"] or 0
-                pnl = (exit_price - entry_price) * TRADE_SIZE
+                pnl = (exit_price - entry_price) * trade_size
             else:
                 # BUY No exit: approximate No price = 1 - Yes ask (Yes + No = 1)
                 exit_price = round(1.0 - (exit_row["pm_best_ask"] or 0), 2)
-                pnl = (exit_price - entry_price) * TRADE_SIZE
+                pnl = (exit_price - entry_price) * trade_size
 
             trades.append({
                 "entry_time": row["timestamp"],
@@ -259,7 +283,7 @@ def run_backtest():
                 is_buy_yes = z_at_entry > 0
 
                 exit_price = 0.5
-                pnl = (exit_price - entry_price) * TRADE_SIZE
+                pnl = (exit_price - entry_price) * trade_size
 
                 trades.append({
                     "entry_time": entry_row["timestamp"],
@@ -273,10 +297,10 @@ def run_backtest():
                 })
         i += 1
 
-    print_report(trades, TRADE_SIZE)
+    print_report(trades, trade_size)
 
 
-def print_report(trades, trade_size):
+def print_report(trades, trade_size, initial_capital=None, final_capital=None):
     if not trades:
         print("[BACKTEST] No filled trades found.")
         return
@@ -316,6 +340,9 @@ def print_report(trades, trade_size):
     print(f"  Expired P&L:     {expired_pnl:+.4f}")
     print(f"  Total Rebates:   {total_rebates:+.4f}")
     print(f"  Max drawdown:    {max_dd:.4f}")
+    if initial_capital is not None and final_capital is not None:
+        print(f"  Final Capital:   {final_capital:.4f}")
+        print(f"  Total Return:    {((final_capital - initial_capital) / initial_capital * 100):+.2f}%")
     print("=" * 65)
     print()
 
@@ -358,5 +385,5 @@ if __name__ == "__main__":
             sys.exit(0)
             
         print(f"\n[BACKTEST] Running Simulated Backtest (z_threshold={z_threshold})...")
-        trades = run_simulated_backtest(rows, TRADE_SIZE, z_threshold)
-        print_report(trades, TRADE_SIZE)
+        trades, final_capital = run_simulated_backtest(rows, capital, trade_size_pct, z_threshold)
+        print_report(trades, capital * trade_size_pct / 100, initial_capital=capital, final_capital=final_capital)
