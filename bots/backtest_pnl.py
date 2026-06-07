@@ -101,10 +101,10 @@ def run_simulated_backtest(rows, capital, trade_size_pct, z_threshold):
         if not in_trade:
             if abs(z_score) > z_threshold:
                 is_buy_yes = z_score > 0
+                pm_best_bid = row.get("pm_best_bid") if row.get("pm_best_bid") is not None else 0.0
                 pm_best_ask = row.get("pm_best_ask") if row.get("pm_best_ask") is not None else 0.0
-                pm_ask_no = row.get("pm_ask_no") if row.get("pm_ask_no") is not None else 0.0
                 
-                entry_price = pm_best_ask - 0.01 if is_buy_yes else pm_ask_no - 0.01
+                entry_price = pm_best_bid + 0.01 if is_buy_yes else (1.0 - pm_best_ask) + 0.01
                 entry_price = round(entry_price, 2)
                 
                 if entry_price <= 0:
@@ -179,22 +179,68 @@ def run_simulated_backtest(rows, capital, trade_size_pct, z_threshold):
                 pm_best_bid = row.get("pm_best_bid") if row.get("pm_best_bid") is not None else 0.0
                 pm_best_ask = row.get("pm_best_ask") if row.get("pm_best_ask") is not None else 0.0
                 
-                exit_price = pm_best_bid if is_buy_yes_val else 1.0 - pm_best_ask
-                exit_price = round(exit_price, 2)
-                rebate = entry_price_val * current_trade_size * 0.0036
-                pnl = (exit_price - entry_price_val) * current_trade_size + rebate
-                trades.append({
-                    "entry_time": entry_row["timestamp"],
-                    "exit_time": row["timestamp"],
-                    "entry_price": entry_price_val,
-                    "exit_price": exit_price,
-                    "side": "BUY Yes" if is_buy_yes_val else "BUY No",
-                    "pnl": round(pnl, 4),
-                    "rebate": round(rebate, 4),
-                    "z_entry": round(z_entry_val, 2),
-                })
+                if is_buy_yes_val:
+                    exit_price_target = round(pm_best_ask - 0.01, 2)
+                else:
+                    exit_price_target = round((1.0 - pm_best_bid) - 0.01, 2)
+                
+                filled = False
+                fill_idx = -1
+                for k in range(idx + 1, min(idx + 61, len(rows))):
+                    r = rows[k]
+                    r_bid = r.get("pm_best_bid") if r.get("pm_best_bid") is not None else 0.0
+                    r_ask = r.get("pm_best_ask") if r.get("pm_best_ask") is not None else 0.0
+                    
+                    if is_buy_yes_val:
+                        if r_bid >= exit_price_target:
+                            filled = True
+                            fill_idx = k
+                            break
+                    else:
+                        r_bid_no = 1.0 - r_ask
+                        if r_bid_no >= exit_price_target:
+                            filled = True
+                            fill_idx = k
+                            break
+                
+                if filled:
+                    exit_price = exit_price_target
+                    rebate = entry_price_val * current_trade_size * 0.0036
+                    pnl = (exit_price - entry_price_val) * current_trade_size + rebate
+                    trades.append({
+                        "entry_time": entry_row["timestamp"],
+                        "exit_time": rows[fill_idx]["timestamp"],
+                        "entry_price": entry_price_val,
+                        "exit_price": exit_price,
+                        "side": "BUY Yes" if is_buy_yes_val else "BUY No",
+                        "pnl": round(pnl, 4),
+                        "rebate": round(rebate, 4),
+                        "z_entry": round(z_entry_val, 2),
+                    })
+                    idx = fill_idx + 1
+                else:
+                    last_idx = min(idx + 60, len(rows) - 1)
+                    r = rows[last_idx]
+                    r_bid = r.get("pm_best_bid") if r.get("pm_best_bid") is not None else 0.0
+                    r_ask = r.get("pm_best_ask") if r.get("pm_best_ask") is not None else 0.0
+                    
+                    exit_price = r_bid if is_buy_yes_val else (1.0 - r_ask)
+                    exit_price = round(exit_price, 2)
+                    rebate = entry_price_val * current_trade_size * 0.0036
+                    pnl = (exit_price - entry_price_val) * current_trade_size + rebate
+                    trades.append({
+                        "entry_time": entry_row["timestamp"],
+                        "exit_time": r["timestamp"],
+                        "entry_price": entry_price_val,
+                        "exit_price": exit_price,
+                        "side": "BUY Yes" if is_buy_yes_val else "BUY No",
+                        "pnl": round(pnl, 4),
+                        "rebate": round(rebate, 4),
+                        "z_entry": round(z_entry_val, 2),
+                    })
+                    idx = last_idx + 1
+                
                 in_trade = False
-                idx += 1
                 if abs(pnl) >= 0.01:
                     capital += pnl
                     current_trade_size = capital * trade_size_pct / 100
@@ -346,11 +392,7 @@ def print_report(trades, trade_size, initial_capital=None, final_capital=None):
     print("=" * 65)
     print()
 
-    # Detail table
-    print(f"{'#':<4} {'Side':<18} {'Entry':>8} {'Exit':>8} {'P&L':>10} {'Z':>6}  Entry Time")
-    print("-" * 88)
-    for i, t in enumerate(trades, 1):
-        print(f"{i:<4} {t['side']:<18} {t['entry_price']:>8.2f} {t['exit_price']:>8.2f} {t['pnl']:>+10.4f} {t['z_entry']:>6.2f}  {t['entry_time']}")
+
 
 
 if __name__ == "__main__":
