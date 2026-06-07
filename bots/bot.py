@@ -119,32 +119,7 @@ async def get_market_volume(session, slug, headers):
     return 0.0
 
 
-async def get_pm_prices(session, token_yes, token_no, headers):
-    """Retrieve ask_yes, bid_yes, and ask_no from CLOB price endpoints. Returns (bid_yes, ask_yes, ask_no)."""
-    try:
-        url_ask_yes = f"https://clob.polymarket.com/price?token_id={token_yes}&side=BUY"
-        url_bid_yes = f"https://clob.polymarket.com/price?token_id={token_yes}&side=SELL"
-        url_ask_no = f"https://clob.polymarket.com/price?token_id={token_no}&side=BUY"
-        
-        async def fetch_price(url):
-            try:
-                async with session.get(url, headers=headers, timeout=5) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        return float(data.get('price', 0.0))
-            except Exception:
-                pass
-            return 0.0
 
-        ask_yes, bid_yes, ask_no = await asyncio.gather(
-            fetch_price(url_ask_yes),
-            fetch_price(url_bid_yes),
-            fetch_price(url_ask_no)
-        )
-        
-        return bid_yes, ask_yes, ask_no
-    except Exception:
-        return 0.0, 0.0, 0.0
 
 
 async def get_pm_book(session, token_id, headers):
@@ -414,20 +389,24 @@ async def main():
                     await asyncio.sleep(0.1)
                     continue
 
-                # Fetch Binance OBI, Polymarket book, and Polymarket prices concurrently
+                # Fetch Binance OBI and Polymarket book concurrently
                 binance_obi_task = get_binance_obi(session, ticker)
                 pm_book_task = get_pm_book(session, token_yes, headers)
-                pm_prices_task = get_pm_prices(session, token_yes, token_no, headers)
                 
-                obi_trad_raw, book_pm, pm_prices = await asyncio.gather(
+                obi_trad_raw, book_pm = await asyncio.gather(
                     binance_obi_task,
-                    pm_book_task,
-                    pm_prices_task
+                    pm_book_task
                 )
-                bid_yes, ask_yes, ask_no = pm_prices
                 
                 bids_pm = pd.DataFrame(book_pm.get('bids', []))
                 asks_pm = pd.DataFrame(book_pm.get('asks', []))
+                
+                best_bid = float(bids_pm.iloc[0]['price']) if not bids_pm.empty else 0.0
+                best_ask = float(asks_pm.iloc[0]['price']) if not asks_pm.empty else 0.0
+                
+                bid_yes = best_bid
+                ask_yes = best_ask
+                ask_no = round(1.0 - best_bid, 2)
                 
                 size_col = 'size' if not bids_pm.empty and 'size' in bids_pm.columns else 1
                 size_col_ask = 'size' if not asks_pm.empty and 'size' in asks_pm.columns else 1
@@ -472,9 +451,7 @@ async def main():
 
                 obi_pm = calculate_obi(pd.DataFrame({"bid_size": [v_b_pm], "ask_size": [v_a_pm]})) if (v_b_pm + v_a_pm) > 0 else 0
 
-                # Extract best bid/ask for logging and order pricing via /price endpoint
-                best_bid = bid_yes
-                best_ask = ask_yes
+
 
                 ema_binance = obi_trad_raw if ema_binance is None else (obi_trad_raw * alpha) + (ema_binance * (1 - alpha))
 
