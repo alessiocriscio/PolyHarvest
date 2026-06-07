@@ -191,50 +191,10 @@ async def fetch_active_token(session, slug, url, headers, current_spot_price):
                 min_distance, best_idx = abs(strike - current_spot_price), i
 
         if min_distance == float('inf'):
-            import datetime
-            past_markets = []
-            future_markets = []
-            now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-            pattern = r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{1,2})[,\s]+(\d{1,2}):(\d{2})\s*(AM|PM)'
-            months = {
-                'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
-                'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
-            }
-            for i, m in enumerate(market_list):
-                match = re.search(pattern, m[0], re.IGNORECASE)
-                if match:
-                    month_str, day_str, hour_str, minute_str, am_pm = match.groups()
-                    try:
-                        month = months[month_str.lower()[:3]]
-                        day = int(day_str)
-                        hour = int(hour_str)
-                        minute = int(minute_str)
-                        if am_pm.upper() == 'PM' and hour < 12:
-                            hour += 12
-                        elif am_pm.upper() == 'AM' and hour == 12:
-                            hour = 0
-                        dt_est = datetime.datetime(now_utc.year, month, day, hour, minute)
-                        # ET = UTC - 4 hours => UTC = ET + 4 hours
-                        dt_utc = dt_est + datetime.timedelta(hours=4)
-                        if dt_utc <= now_utc:
-                            past_markets.append((dt_utc, i))
-                        else:
-                            future_markets.append((dt_utc, i))
-                    except (ValueError, KeyError):
-                        pass
-            if past_markets:
-                best_idx = max(past_markets, key=lambda x: x[0])[1]
-            elif future_markets:
-                best_idx = min(future_markets, key=lambda x: x[0])[1]
-            else:
-                best_idx = len(market_list) - 1
+            return None, None, None
 
         question, token_yes, token_no = market_list[best_idx]
-        if min_distance < float('inf'):
-            print(f"\n[ATM TARGET] {question} | Distance: {min_distance:.2f}")
-        else:
-            print(f"\n[FALLBACK] No strike prices found — using parsed/latest active market: {question}")
-
+        print(f"\n[ATM TARGET] {question} | Distance: {min_distance:.2f}")
         return question, token_yes, token_no
     except Exception as e:
         print(f"[ERROR] fetch_active_token: {e}")
@@ -312,19 +272,13 @@ async def main():
 
         slug = url.rstrip('/').split('/')[-1].split('?')[0]
 
-        is_updown = '-updown-5m-' in slug
+        base_slug = re.sub(r'-\d+$', '', slug)
+        active_slug = await find_current_event_slug(session, base_slug, headers)
         question, token_yes, token_no = None, None, None
-
-        if not is_updown:
+        if active_slug:
+            slug = active_slug
+            url = f"https://polymarket.com/event/{slug}" if "/event/" in url else f"https://polymarket.com/market/{slug}"
             question, token_yes, token_no = await fetch_active_token(session, slug, url, headers, current_spot_price)
-
-        if is_updown or token_yes is None:
-            base_slug = re.sub(r'-\d+$', '', slug)
-            active_slug = await find_current_event_slug(session, base_slug, headers)
-            if active_slug:
-                slug = active_slug
-                url = f"https://polymarket.com/event/{slug}" if "/event/" in url else f"https://polymarket.com/market/{slug}"
-                question, token_yes, token_no = await fetch_active_token(session, slug, url, headers, current_spot_price)
 
         if token_yes is None:
             print("[ERROR] No active market found.")
@@ -370,17 +324,13 @@ async def main():
                         print(f"\n[MARKET EXPIRED] Position force-closed on proactive rotation")
                     
                     current_spot_price = await get_binance_price(session, ticker) or current_spot_price
-                    is_updown = '-updown-5m-' in slug
+                    base_slug = re.sub(r'-\d+$', '', slug)
+                    active_slug = await find_current_event_slug(session, base_slug, headers)
                     new_q, new_yes, new_no = None, None, None
-                    if not is_updown:
+                    if active_slug:
+                        slug = active_slug
+                        url = f"https://polymarket.com/event/{slug}" if "/event/" in url else f"https://polymarket.com/market/{slug}"
                         new_q, new_yes, new_no = await fetch_active_token(session, slug, url, headers, current_spot_price)
-                    if is_updown or new_yes is None:
-                        base_slug = re.sub(r'-\d+$', '', slug)
-                        active_slug = await find_current_event_slug(session, base_slug, headers)
-                        if active_slug:
-                            slug = active_slug
-                            url = f"https://polymarket.com/event/{slug}" if "/event/" in url else f"https://polymarket.com/market/{slug}"
-                            new_q, new_yes, new_no = await fetch_active_token(session, slug, url, headers, current_spot_price)
                     if new_yes is not None:
                         question, token_yes, token_no = new_q, new_yes, new_no
                         print(f"\n[PROACTIVE ROTATION] Market expires in <30s, switching now. New target: {question}")
@@ -428,17 +378,13 @@ async def main():
                                 db_conn.commit()
                             print(f"\n[MARKET EXPIRED] Position force-closed on market rotation")
                         current_spot_price = await get_binance_price(session, ticker) or current_spot_price
-                        is_updown = '-updown-5m-' in slug
+                        base_slug = re.sub(r'-\d+$', '', slug)
+                        active_slug = await find_current_event_slug(session, base_slug, headers)
                         new_q, new_yes, new_no = None, None, None
-                        if not is_updown:
+                        if active_slug:
+                            slug = active_slug
+                            url = f"https://polymarket.com/event/{slug}" if "/event/" in url else f"https://polymarket.com/market/{slug}"
                             new_q, new_yes, new_no = await fetch_active_token(session, slug, url, headers, current_spot_price)
-                        if is_updown or new_yes is None:
-                            base_slug = re.sub(r'-\d+$', '', slug)
-                            active_slug = await find_current_event_slug(session, base_slug, headers)
-                            if active_slug:
-                                slug = active_slug
-                                url = f"https://polymarket.com/event/{slug}" if "/event/" in url else f"https://polymarket.com/market/{slug}"
-                                new_q, new_yes, new_no = await fetch_active_token(session, slug, url, headers, current_spot_price)
                         if new_yes is not None:
                             question, token_yes, token_no = new_q, new_yes, new_no
                             print(f"\n[MARKET ROTATION] New target: {question}")
@@ -489,13 +435,13 @@ async def main():
                                 in_trade = True
                                 if z_score > 0:
                                     direction = "BUY (PM Underpriced)"
-                                    sig_price = round(ask_yes - 0.01, 2)
+                                    sig_price = round(best_bid + 0.01, 2)
                                     trade_direction = "Yes"
                                     entry_price = sig_price
                                     order_id, fill_status = await asyncio.to_thread(send_executor_signal, token_yes, "BUY", sig_price, TRADE_SIZE)
                                 else:
                                     direction = "SELL (PM Overpriced)"
-                                    sig_price = round(ask_no - 0.01, 2)
+                                    sig_price = round((1.0 - best_ask) + 0.01, 2)
                                     trade_direction = "No"
                                     entry_price = sig_price
                                     order_id, fill_status = await asyncio.to_thread(send_executor_signal, token_no, "BUY", sig_price, TRADE_SIZE)
@@ -504,11 +450,18 @@ async def main():
                     elif in_trade and abs(z_score) < 0.5:
                         in_trade = False
                         if trade_direction == "Yes":
-                            estimated_pnl = (best_bid - entry_price) * TRADE_SIZE
+                            # Passive Maker Exit for YES: Sell at current Best Ask - 0.01
+                            exit_sig_price = round(best_ask - 0.01, 2)
+                            order_id, fill_status = await asyncio.to_thread(send_executor_signal, token_yes, "SELL", exit_sig_price, TRADE_SIZE)
+                            estimated_pnl = (exit_sig_price - entry_price) * TRADE_SIZE
                         else:
-                            estimated_pnl = (ask_no - entry_price) * TRADE_SIZE
+                            # Passive Maker Exit for NO: Sell at synthetic Best Ask for NO (1.0 - best_bid) - 0.01
+                            exit_sig_price = round((1.0 - best_bid) - 0.01, 2)
+                            order_id, fill_status = await asyncio.to_thread(send_executor_signal, token_no, "SELL", exit_sig_price, TRADE_SIZE)
+                            estimated_pnl = (exit_sig_price - entry_price) * TRADE_SIZE
+                        
                         daily_pnl += estimated_pnl
-                        print(f"\n[EXIT] Z-Score back to {z_score:.2f} | Position closed | Estimated P&L: {estimated_pnl:+.4f} | Daily P&L: {daily_pnl:+.4f}")
+                        print(f"\n[EXIT] Z-Score back to {z_score:.2f} | Maker Exit Order Placed: {fill_status} | Estimated P&L: {estimated_pnl:+.4f} | Daily P&L: {daily_pnl:+.4f}")
                         if abs(estimated_pnl) >= 0.01:
                             capital += estimated_pnl
                             TRADE_SIZE = capital * trade_size_pct / 100
