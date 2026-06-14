@@ -100,16 +100,24 @@ def run_simulated_backtest(rows, capital, trade_size_pct, z_threshold):
         
         if not in_trade:
             if abs(z_score) > z_threshold:
-                is_buy_yes = z_score > 0
-                pm_best_bid = row.get("pm_best_bid") if row.get("pm_best_bid") is not None else 0.0
-                pm_best_ask = row.get("pm_best_ask") if row.get("pm_best_ask") is not None else 0.0
-                
-                entry_price = pm_best_bid + 0.01 if is_buy_yes else (1.0 - pm_best_ask) + 0.01
-                entry_price = round(entry_price, 2)
-                
-                if entry_price <= 0:
+                pm_best_bid = row.get("pm_best_bid")
+                pm_best_ask = row.get("pm_best_ask")
+                if pm_best_bid is None or pm_best_ask is None or pm_best_bid == 0.0 or pm_best_ask == 0.0:
                     idx += 1
                     continue
+                
+                try:
+                    pm_best_bid = float(pm_best_bid)
+                    pm_best_ask = float(pm_best_ask)
+                except (ValueError, TypeError):
+                    idx += 1
+                    continue
+                
+                is_buy_yes = z_score > 0
+                if is_buy_yes:
+                    entry_price = round(pm_best_bid + 0.01, 2)
+                else:
+                    entry_price = round((1.0 - pm_best_ask) + 0.01, 2)
                 
                 if entry_price < 0.05 or entry_price > 0.95:
                     skipped_extreme += 1
