@@ -134,71 +134,43 @@ async def get_pm_book(session, token_id, headers):
     return {}
 
 
-async def find_current_event_slug(session, base_slug, headers=None):
-    """Find the current active event slug by checking the current time slot and up to 3 previous slots."""
-    current_time = int(time.time())
-    current_slot = (current_time // 300) * 300
-    for offset in [0, -300, -600, -900]:
-        slot = current_slot + offset
-        slug = f"{base_slug}-{slot}"
-        try:
-            url = f"https://gamma-api.polymarket.com/events?slug={slug}"
-            async with session.get(url, headers=headers, timeout=10) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if isinstance(data, list) and len(data) > 0:
-                        markets = data[0].get('markets', [])
-                        active_markets = [m for m in markets if not m.get('closed', False) and m.get('active', True)]
-                        if active_markets:
-                            return slug
-        except Exception:
-            pass
-    return None
-
-
-async def fetch_active_token(session, slug, url, headers, current_spot_price):
-    """Fetch the best active market token. Returns (question, token_yes, token_no) or (None, None, None)."""
+async def fetch_live_5m_market(session, base_slug, headers):
+    """Queries the parent event slug and returns the closest active 5-minute market tokens."""
     try:
-        req_url = (
-            f"https://gamma-api.polymarket.com/events?slug={slug}" if "/event/" in url
-            else f"https://gamma-api.polymarket.com/markets?slug={slug}"
-        )
-        async with session.get(req_url, headers=headers, timeout=10) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                markets = data[0].get('markets', []) if "/event/" in url else data
-            else:
-                markets = []
-        
-        market_list = []
-        for m in markets:
-            if m.get('closed', False) or not m.get('active', True):
-                continue
-            clobs = m.get('clobTokenIds')
-            if not clobs:
-                continue
-            parsed = json.loads(clobs) if isinstance(clobs, str) else clobs
-            if len(parsed) >= 2:
-                market_list.append((m.get('question'), parsed[1], parsed[0]))
-
-        if not market_list:
-            return None, None, None
-
-        best_idx, min_distance = 0, float('inf')
-        for i, m in enumerate(market_list):
-            strike = extract_strike_price(m[0])
-            if strike and abs(strike - current_spot_price) < min_distance:
-                min_distance, best_idx = abs(strike - current_spot_price), i
-
-        if min_distance == float('inf'):
-            return None, None, None
-
-        question, token_yes, token_no = market_list[best_idx]
-        print(f"\n[ATM TARGET] {question} | Distance: {min_distance:.2f}")
-        return question, token_yes, token_no
+        url = f"https://gamma-api.polymarket.com/events?slug={base_slug}"
+        async with session.get(url, headers=headers, timeout=10) as resp:
+            if resp.status != 200: return None, None, None, None, None
+            data = await resp.json()
+            if not isinstance(data, list) or len(data) == 0: return None, None, None, None, None
+            
+            markets = data[0].get('markets', [])
+            active_markets = []
+            
+            for m in markets:
+                if m.get('closed', False) or not m.get('active', True):
+                    continue
+                clobs = m.get('clobTokenIds')
+                if not clobs: continue
+                parsed = json.loads(clobs) if isinstance(clobs, str) else clobs
+                if len(parsed) < 2: continue
+                
+                # Parse end date
+                end_date_str = m.get('endDate', '').replace('Z', '').split('.')[0]
+                if not end_date_str: continue
+                end_dt = datetime.datetime.fromisoformat(end_date_str)
+                
+                # Keep track of active future markets
+                if end_dt > datetime.datetime.utcnow():
+                    active_markets.append((end_dt, m.get('question'), parsed[1], parsed[0], m.get('slug')))
+            
+            if not active_markets: return None, None, None, None, None
+            
+            # Sort by closest expiry date (the true current LIVE 5m slot)
+            active_markets.sort(key=lambda x: x[0])
+            return active_markets[0] # Returns (market_end_time, question, token_yes, token_no, slug)
     except Exception as e:
-        print(f"[ERROR] fetch_active_token: {e}")
-        return None, None, None
+        print(f"[ERROR] Rotation fetch failed: {e}")
+        return None, None, None, None, None
 
 
 def send_executor_signal(token_id, side, price, size):
@@ -271,20 +243,14 @@ async def main():
         if current_spot_price is None: return
 
         slug = url.rstrip('/').split('/')[-1].split('?')[0]
+        base_slug = re.sub(r'-updown-5m.*$', '-updown-5m', slug)
 
-        base_slug = re.sub(r'-\d+$', '', slug)
-        active_slug = await find_current_event_slug(session, base_slug, headers)
-        question, token_yes, token_no = None, None, None
-        if active_slug:
-            slug = active_slug
-            url = f"https://polymarket.com/event/{slug}" if "/event/" in url else f"https://polymarket.com/market/{slug}"
-            question, token_yes, token_no = await fetch_active_token(session, slug, url, headers, current_spot_price)
-
-        if token_yes is None:
+        res = await fetch_live_5m_market(session, base_slug, headers)
+        if res and res[2] is not None:
+            market_end_time, question, token_yes, token_no, slug = res
+        else:
             print("[ERROR] No active market found.")
             return
-
-        market_end_time = await get_market_end_time(session, slug, headers) or datetime.datetime.max
 
         alpha, ema_binance, spread_history = 0.125, None, []
         empty_book_streak = 0
@@ -313,7 +279,7 @@ async def main():
                     daily_reset_date = datetime.date.today()
 
                 # Proactive market rotation based on expiry timer
-                if datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) >= market_end_time - datetime.timedelta(seconds=30):
+                if datetime.datetime.utcnow() >= market_end_time - datetime.timedelta(seconds=30):
                     if in_trade:
                         in_trade = False
                         if db_cursor is not None:
@@ -323,18 +289,10 @@ async def main():
                             db_conn.commit()
                         print(f"\n[MARKET EXPIRED] Position force-closed on proactive rotation")
                     
-                    current_spot_price = await get_binance_price(session, ticker) or current_spot_price
-                    base_slug = re.sub(r'-\d+$', '', slug)
-                    active_slug = await find_current_event_slug(session, base_slug, headers)
-                    new_q, new_yes, new_no = None, None, None
-                    if active_slug:
-                        slug = active_slug
-                        url = f"https://polymarket.com/event/{slug}" if "/event/" in url else f"https://polymarket.com/market/{slug}"
-                        new_q, new_yes, new_no = await fetch_active_token(session, slug, url, headers, current_spot_price)
-                    if new_yes is not None:
-                        question, token_yes, token_no = new_q, new_yes, new_no
+                    res = await fetch_live_5m_market(session, base_slug, headers)
+                    if res and res[2] is not None:
+                        market_end_time, question, token_yes, token_no, slug = res
                         print(f"\n[PROACTIVE ROTATION] Market expires in <30s, switching now. New target: {question}")
-                        market_end_time = await get_market_end_time(session, slug, headers) or datetime.datetime.max
                     empty_book_streak = 0
                     await asyncio.sleep(0.1)
                     continue
@@ -378,17 +336,10 @@ async def main():
                                 db_conn.commit()
                             print(f"\n[MARKET EXPIRED] Position force-closed on market rotation")
                         current_spot_price = await get_binance_price(session, ticker) or current_spot_price
-                        base_slug = re.sub(r'-\d+$', '', slug)
-                        active_slug = await find_current_event_slug(session, base_slug, headers)
-                        new_q, new_yes, new_no = None, None, None
-                        if active_slug:
-                            slug = active_slug
-                            url = f"https://polymarket.com/event/{slug}" if "/event/" in url else f"https://polymarket.com/market/{slug}"
-                            new_q, new_yes, new_no = await fetch_active_token(session, slug, url, headers, current_spot_price)
-                        if new_yes is not None:
-                            question, token_yes, token_no = new_q, new_yes, new_no
+                        res = await fetch_live_5m_market(session, base_slug, headers)
+                        if res and res[2] is not None:
+                            market_end_time, question, token_yes, token_no, slug = res
                             print(f"\n[MARKET ROTATION] New target: {question}")
-                            market_end_time = await get_market_end_time(session, slug, headers) or datetime.datetime.max
                         empty_book_streak = 0
                         await asyncio.sleep(0.1)
                         continue
