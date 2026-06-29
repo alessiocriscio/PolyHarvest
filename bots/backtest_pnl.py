@@ -29,7 +29,7 @@ def load_rows_from_db():
     cur = conn.cursor()
     try:
         cur.execute("""
-            SELECT rowid, timestamp, z_score, pm_best_bid, pm_best_ask, pm_ask_no, fill_status
+            SELECT rowid, timestamp, z_score, pm_best_bid, pm_best_ask, pm_ask_no, pm_bid_no, fill_status
             FROM spread_log
             ORDER BY rowid ASC
         """)
@@ -45,6 +45,7 @@ def load_rows_from_db():
         for r in cur.fetchall():
             d = dict(r)
             d["pm_ask_no"] = 0.0
+            d["pm_bid_no"] = 0.0
             rows.append(d)
     conn.close()
     return rows
@@ -61,6 +62,7 @@ def load_rows_from_csv(path):
                 "pm_best_bid": float(r["pm_best_bid"]) if (r.get("pm_best_bid") is not None and r.get("pm_best_bid") != "") else 0.0,
                 "pm_best_ask": float(r["pm_best_ask"]) if (r.get("pm_best_ask") is not None and r.get("pm_best_ask") != "") else 0.0,
                 "pm_ask_no": float(r["pm_ask_no"]) if (r.get("pm_ask_no") is not None and r.get("pm_ask_no") != "") else 0.0,
+                "pm_bid_no": float(r["pm_bid_no"]) if (r.get("pm_bid_no") is not None and r.get("pm_bid_no") != "") else 0.0,
                 "fill_status": r.get("fill_status", ""),
             })
     return rows
@@ -117,7 +119,11 @@ def run_simulated_backtest(rows, capital, trade_size_pct, z_threshold):
                 if is_buy_yes:
                     entry_price = round(pm_best_bid + 0.01, 2)
                 else:
-                    entry_price = round((1.0 - pm_best_ask) + 0.01, 2)
+                    pm_bid_no = row.get("pm_bid_no")
+                    if pm_bid_no is None or float(pm_bid_no) == 0.0:
+                        idx += 1
+                        continue
+                    entry_price = round(float(pm_bid_no) + 0.01, 2)
                 
                 if entry_price < 0.05 or entry_price > 0.95:
                     skipped_extreme += 1
@@ -135,15 +141,13 @@ def run_simulated_backtest(rows, capital, trade_size_pct, z_threshold):
                     r_ask_no = r.get("pm_ask_no") if r.get("pm_ask_no") is not None else 0.0
                     
                     if is_buy_yes:
-                        # Correct Maker Execution for YES: market ASK must drop to or below our Buy Limit Price
                         if r_ask > 0 and r_ask <= entry_price:
                             filled = True
                             fill_idx = k
                             break
                     else:
-                        # Correct Maker Execution for NO: market NO ASK must drop to or below our Buy Limit Price
-                        current_ask_no = r_ask_no if r_ask_no > 0 else round(1.0 - r_bid, 2)
-                        if current_ask_no > 0 and current_ask_no <= entry_price:
+                        r_ask_no = r.get("pm_ask_no") if r.get("pm_ask_no") is not None else 0.0
+                        if r_ask_no > 0 and r_ask_no <= entry_price:
                             filled = True
                             fill_idx = k
                             break
@@ -190,7 +194,8 @@ def run_simulated_backtest(rows, capital, trade_size_pct, z_threshold):
                 if is_buy_yes_val:
                     exit_price_target = round(pm_best_ask - 0.01, 2)
                 else:
-                    exit_price_target = round((1.0 - pm_best_bid) - 0.01, 2)
+                    pm_ask_no = row.get("pm_ask_no") if row.get("pm_ask_no") is not None else 0.0
+                    exit_price_target = round(float(pm_ask_no) - 0.01, 2)
                 
                 filled = False
                 fill_idx = -1
@@ -205,7 +210,7 @@ def run_simulated_backtest(rows, capital, trade_size_pct, z_threshold):
                             fill_idx = k
                             break
                     else:
-                        r_bid_no = 1.0 - r_ask
+                        r_bid_no = r.get("pm_bid_no") if r.get("pm_bid_no") is not None else 0.0
                         if r_bid_no >= exit_price_target:
                             filled = True
                             fill_idx = k
@@ -232,7 +237,8 @@ def run_simulated_backtest(rows, capital, trade_size_pct, z_threshold):
                     r_bid = r.get("pm_best_bid") if r.get("pm_best_bid") is not None else 0.0
                     r_ask = r.get("pm_best_ask") if r.get("pm_best_ask") is not None else 0.0
                     
-                    exit_price = r_bid if is_buy_yes_val else (1.0 - r_ask)
+                    r_bid_no = r.get("pm_bid_no") if r.get("pm_bid_no") is not None else 0.0
+                    exit_price = r_bid if is_buy_yes_val else r_bid_no
                     exit_price = round(exit_price, 2)
                     rebate = entry_price_val * current_trade_size * 0.0036
                     pnl = (exit_price - entry_price_val) * current_trade_size + rebate
@@ -311,7 +317,7 @@ def run_backtest():
                 pnl = (exit_price - entry_price) * trade_size
             else:
                 # BUY No exit: approximate No price = 1 - Yes ask (Yes + No = 1)
-                exit_price = round(1.0 - (exit_row["pm_best_ask"] or 0), 2)
+                exit_price = exit_row["pm_bid_no"] or 0.0
                 pnl = (exit_price - entry_price) * trade_size
 
             trades.append({
