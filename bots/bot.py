@@ -10,6 +10,7 @@ import re
 import sqlite3
 import datetime
 from obi_engine import calculate_obi
+from pm_ws import PMBookFeed
 
 ASSET_CONFIG = {
     "BTC": {"pm_prefix": "btc", "binance_symbol": "BTCUSDT"},
@@ -312,6 +313,13 @@ async def main():
         market_end_ts = slot_start + SLOT_SECONDS
         print(f"[SYSTEM] Tracking: {question} ({slug})")
 
+        # Books stream over the CLOB WebSocket; REST /book is only the fallback
+        # while the socket is down or has not sent a snapshot yet.
+        feed = PMBookFeed(session, headers)
+        await feed.track([token_yes, token_no])
+        feed.start()
+        ws_was_live = False
+
         alpha, ema_binance, spread_history = 0.125, None, []
         last_row = None  # last tick logged for the current market
         next_market = None  # next slot's market, pre-fetched before expiry
@@ -348,6 +356,7 @@ async def main():
                         rotation_retry_count = 0
                         stall_retry_count = 0
                         spread_history = []
+                        await feed.track([token_yes, token_no])
                         print(f"\n[PROACTIVE ROTATION] Switched to next active slot: {question} ({slug})")
                         await asyncio.sleep(0.1)
                         continue
@@ -363,14 +372,29 @@ async def main():
                         and now_ts >= market_end_ts - PREFETCH_LEAD_SECONDS):
                     next_market, _ = await fetch_5m_market(session, ticker, headers, slot_start + SLOT_SECONDS)
                     next_prefetch_ts = now_ts + 5
+                    if next_market is not None:
+                        # subscribe early so the next market's books are live at the switch
+                        await feed.track([token_yes, token_no, next_market[2], next_market[3]])
 
-                # Fetch Binance OBI and both Polymarket books CONCURRENTLY
-                # instead of sequentially, to minimize per-tick round-trip latency.
-                obi_trad_raw, (book_yes, err_yes), (book_no, err_no) = await asyncio.gather(
-                    get_binance_obi(session, ticker),
-                    get_pm_book(session, token_yes, headers),
-                    get_pm_book(session, token_no, headers)
-                )
+                book_yes, book_no = feed.get_book(token_yes), feed.get_book(token_no)
+                ws_live = book_yes is not None and book_no is not None
+                if ws_live != ws_was_live:
+                    if ws_live:
+                        print("\n[BOOK FEED] WebSocket live")
+                    else:
+                        print(f"\n[BOOK FEED] REST fallback ({feed.last_error or 'waiting for snapshot'})")
+                    ws_was_live = ws_live
+                if ws_live:
+                    err_yes = err_no = None
+                    obi_trad_raw = await get_binance_obi(session, ticker)
+                else:
+                    # Fetch Binance OBI and both Polymarket books CONCURRENTLY
+                    # instead of sequentially, to minimize per-tick round-trip latency.
+                    obi_trad_raw, (book_yes, err_yes), (book_no, err_no) = await asyncio.gather(
+                        get_binance_obi(session, ticker),
+                        get_pm_book(session, token_yes, headers),
+                        get_pm_book(session, token_no, headers)
+                    )
 
                 if book_yes is None or book_no is None:
                     stall_retry_count += 1
@@ -429,7 +453,7 @@ async def main():
                     db_cursor.execute(INSERT_SQL, last_row)
                     db_conn.commit()
 
-                status(f"Logging... YES {fmt_px(best_bid)}/{fmt_px(best_ask)} | NO {fmt_px(bid_no)}/{fmt_px(ask_no)} | "
+                status(f"Logging [{'WS' if ws_live else 'REST'}]... YES {fmt_px(best_bid)}/{fmt_px(best_ask)} | NO {fmt_px(bid_no)}/{fmt_px(ask_no)} | "
                        f"Z-Score: {z_score:.2f} | Spread: {divergence:.4f} | T-{max(0, int(market_end_ts - time.time()))}s")
                 await asyncio.sleep(0.1)
 
