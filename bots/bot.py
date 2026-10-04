@@ -1,3 +1,4 @@
+import os
 import sys
 import time
 import socket
@@ -25,6 +26,23 @@ ROTATE_LEAD_SECONDS = 1     # switch to the next slot this long before expiry
 PREFETCH_LEAD_SECONDS = 30  # look up the next slot's market this long before expiry
 OBI_BAND = 0.15             # only levels within this distance from the mid
 OBI_LEVELS = 5              # top-of-book levels used for the Polymarket OBI
+
+INTERACTIVE = sys.stdout.isatty()
+_last_status_ts = 0.0
+
+
+def status(msg):
+    """
+    Transient status line: overwritten in place on a terminal, throttled to one
+    line per minute when running unattended (systemd journal).
+    """
+    global _last_status_ts
+    if INTERACTIVE:
+        print(msg + "      ", end="\r", flush=True)
+    elif time.time() - _last_status_ts >= 60:
+        _last_status_ts = time.time()
+        print(msg, flush=True)
+
 
 INSERT_SQL = (
     "INSERT INTO spread_log (ticker, binance_obi_raw, binance_ema, polymarket_obi, spread, z_score, "
@@ -254,7 +272,11 @@ def send_executor_signal(token_id, side, price, size):
 async def main():
     print(f"[SYSTEM] Kernel: {sys.version.split()[0]}")
 
-    log_choice = input("Enable data logging to market_data.db? [Y/n]: ").strip().lower()
+    # PM_LOGGING / PM_ASSET skip the prompts, so the bot can run unattended
+    log_choice = os.environ.get("PM_LOGGING")
+    if log_choice is None:
+        log_choice = input("Enable data logging to market_data.db? [Y/n]: ")
+    log_choice = log_choice.strip().lower()
     if log_choice in ('', 'y', 'yes'):
         db_conn = init_db()
         db_cursor = db_conn.cursor()
@@ -265,7 +287,10 @@ async def main():
 
     headers = {'User-Agent': 'Mozilla/5.0'}
 
-    asset_choice = input(f"Select asset {list(ASSET_CONFIG.keys())} [default: BTC]: ").strip().upper()
+    asset_choice = os.environ.get("PM_ASSET")
+    if asset_choice is None:
+        asset_choice = input(f"Select asset {list(ASSET_CONFIG.keys())} [default: BTC]: ")
+    asset_choice = asset_choice.strip().upper()
     ASSET = asset_choice if asset_choice in ASSET_CONFIG else "BTC"
     print(f"[SYSTEM] Using asset: {ASSET}")
     ticker = ASSET_CONFIG[ASSET]["binance_symbol"]
@@ -326,7 +351,7 @@ async def main():
                         continue
                     else:
                         rotation_retry_count += 1
-                        print(f"[WAITING] Next market not live yet ({err}), retry #{rotation_retry_count}...    ", end="\r", flush=True)
+                        status(f"[WAITING] Next market not live yet ({err}), retry #{rotation_retry_count}...")
                         await asyncio.sleep(1.0)
                         continue
 
@@ -347,7 +372,7 @@ async def main():
 
                 if book_yes is None or book_no is None:
                     stall_retry_count += 1
-                    print(f"[WAITING] Polymarket book unavailable ({err_yes or err_no}), retry #{stall_retry_count}...    ", end="\r", flush=True)
+                    status(f"[WAITING] Polymarket book unavailable ({err_yes or err_no}), retry #{stall_retry_count}...")
                     await asyncio.sleep(0.5)
                     continue
 
@@ -356,7 +381,7 @@ async def main():
 
                 if not bids_yes and not asks_yes:
                     stall_retry_count += 1
-                    print(f"[WAITING] Book empty, retry #{stall_retry_count}...    ", end="\r", flush=True)
+                    status(f"[WAITING] Book empty, retry #{stall_retry_count}...")
                     await asyncio.sleep(0.5)
                     continue
                 stall_retry_count = 0
@@ -402,8 +427,8 @@ async def main():
                     db_cursor.execute(INSERT_SQL, last_row)
                     db_conn.commit()
 
-                print(f"Logging... YES {fmt_px(best_bid)}/{fmt_px(best_ask)} | NO {fmt_px(bid_no)}/{fmt_px(ask_no)} | "
-                      f"Z-Score: {z_score:.2f} | Spread: {divergence:.4f} | T-{max(0, int(market_end_ts - time.time()))}s      ", end="\r", flush=True)
+                status(f"Logging... YES {fmt_px(best_bid)}/{fmt_px(best_ask)} | NO {fmt_px(bid_no)}/{fmt_px(ask_no)} | "
+                       f"Z-Score: {z_score:.2f} | Spread: {divergence:.4f} | T-{max(0, int(market_end_ts - time.time()))}s")
                 await asyncio.sleep(0.1)
 
             except KeyboardInterrupt:

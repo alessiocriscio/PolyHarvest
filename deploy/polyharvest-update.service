@@ -1,0 +1,7 @@
+[Unit]
+Description=Update PolyHarvest from GitHub and restart the bot if main changed
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /home/azureuser/bot_pm/deploy/update.sh
