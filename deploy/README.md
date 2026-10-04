@@ -10,9 +10,12 @@ viene ripristinato il commit precedente e quello difettoso non viene più ritent
 - Se si modificano i file `.service` / `.timer`, vanno ricopiati a mano in `/etc/systemd/system/`
   e va eseguito `sudo systemctl daemon-reload`.
 
-I book di Polymarket arrivano dal WebSocket del CLOB (`bots/pm_ws.py`); finché il socket è giù
-o non ha ancora mandato lo snapshot, il bot legge `/book` via REST. Il journal registra ogni
-passaggio con una riga `[BOOK FEED] WebSocket live` / `[BOOK FEED] REST fallback (...)`.
+I book arrivano in diretta via WebSocket: Polymarket dal CLOB (`bots/pm_ws.py`), Binance dallo
+stream `depth5@100ms` dei futures (`bots/binance_ws.py`). Finché un socket è giù o non ha ancora
+mandato dati, il bot legge quel book via REST. Il journal registra ogni passaggio con una riga
+`[BOOK FEED] <fonte>: WebSocket live` / `[BOOK FEED] <fonte>: REST fallback (...)`.
+
+Il database è `bots/market_data.db`. Per azzerarlo: fermare il bot, cancellare il file, riavviare.
 
 Comandi utili sul server:
 

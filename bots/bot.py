@@ -11,6 +11,7 @@ import sqlite3
 import datetime
 from obi_engine import calculate_obi
 from pm_ws import PMBookFeed
+from binance_ws import BinanceDepthFeed
 
 ASSET_CONFIG = {
     "BTC": {"pm_prefix": "btc", "binance_symbol": "BTCUSDT"},
@@ -47,8 +48,8 @@ def status(msg):
 
 INSERT_SQL = (
     "INSERT INTO spread_log (ticker, binance_obi_raw, binance_ema, polymarket_obi, spread, z_score, "
-    "pm_best_bid, pm_best_ask, pm_ask_no, pm_bid_no, order_id, fill_status, market_slug) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "pm_best_bid, pm_best_ask, pm_ask_no, pm_bid_no, order_id, fill_status, market_slug, ts_unix) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
 
@@ -65,7 +66,8 @@ def init_db():
                   z_score REAL,
                   pm_ask_no REAL)''')
     # Migrate schema: add columns if missing (safe for existing DBs)
-    for col_def in ['pm_best_bid REAL', 'pm_best_ask REAL', 'order_id TEXT', 'fill_status TEXT', 'pm_ask_no REAL', 'pm_bid_no REAL', 'market_slug TEXT']:
+    for col_def in ['pm_best_bid REAL', 'pm_best_ask REAL', 'order_id TEXT', 'fill_status TEXT', 'pm_ask_no REAL', 'pm_bid_no REAL', 'market_slug TEXT',
+                    'ts_unix REAL']:  # unix seconds with sub-second precision ("timestamp" has whole seconds only)
         try:
             c.execute(f'ALTER TABLE spread_log ADD COLUMN {col_def}')
         except sqlite3.OperationalError:
@@ -74,22 +76,26 @@ def init_db():
     return conn
 
 
+def binance_obi(bids, asks):
+    """OBI over the top 5 levels of a Binance book side pair ([[price, qty], ...], best first)."""
+    vol_bids = sum(float(q) for _, q in bids[:5])
+    vol_asks = sum(float(q) for _, q in asks[:5])
+    df = pd.DataFrame({"bid_size": [vol_bids], "ask_size": [vol_asks]})
+    return calculate_obi(df) if (vol_bids + vol_asks) > 0 else 0
+
+
 async def get_binance_obi(session, symbol):
+    """REST fallback for the depth stream. Returns None on failure, never a fake 0."""
     # USDM perp futures: più volume, lead spot, più istituzionale
     url = f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit=5"
     try:
         async with session.get(url, timeout=3) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                bids = pd.DataFrame(data.get('bids', []), columns=['price', 'bid_size']).astype(float)
-                asks = pd.DataFrame(data.get('asks', []), columns=['price', 'ask_size']).astype(float)
-                vol_bids = bids.head(5)['bid_size'].sum() if not bids.empty else 0
-                vol_asks = asks.head(5)['ask_size'].sum() if not asks.empty else 0
-                df = pd.DataFrame({"bid_size": [vol_bids], "ask_size": [vol_asks]})
-                return calculate_obi(df) if (vol_bids + vol_asks) > 0 else 0
+                return binance_obi(data.get('bids', []), data.get('asks', []))
     except Exception:
         pass
-    return 0
+    return None
 
 
 async def get_binance_price(session, symbol):
@@ -318,7 +324,18 @@ async def main():
         feed = PMBookFeed(session, headers)
         await feed.track([token_yes, token_no])
         feed.start()
-        ws_was_live = False
+        # Same for Binance: depth5@100ms stream, REST /depth only as fallback.
+        bfeed = BinanceDepthFeed(session, ticker)
+        bfeed.start()
+        feed_live = {"Polymarket": False, "Binance": False}
+
+        def report_feed(name, live, err):
+            if live != feed_live[name]:
+                feed_live[name] = live
+                if live:
+                    print(f"\n[BOOK FEED] {name}: WebSocket live")
+                else:
+                    print(f"\n[BOOK FEED] {name}: REST fallback ({err or 'waiting for first update'})")
 
         alpha, ema_binance, spread_history = 0.125, None, []
         last_row = None  # last tick logged for the current market
@@ -376,25 +393,35 @@ async def main():
                         # subscribe early so the next market's books are live at the switch
                         await feed.track([token_yes, token_no, next_market[2], next_market[3]])
 
+                # Both books normally come from memory (WebSocket feeds): no network wait.
                 book_yes, book_no = feed.get_book(token_yes), feed.get_book(token_no)
-                ws_live = book_yes is not None and book_no is not None
-                if ws_live != ws_was_live:
-                    if ws_live:
-                        print("\n[BOOK FEED] WebSocket live")
-                    else:
-                        print(f"\n[BOOK FEED] REST fallback ({feed.last_error or 'waiting for snapshot'})")
-                    ws_was_live = ws_live
-                if ws_live:
-                    err_yes = err_no = None
-                    obi_trad_raw = await get_binance_obi(session, ticker)
-                else:
-                    # Fetch Binance OBI and both Polymarket books CONCURRENTLY
-                    # instead of sequentially, to minimize per-tick round-trip latency.
-                    obi_trad_raw, (book_yes, err_yes), (book_no, err_no) = await asyncio.gather(
-                        get_binance_obi(session, ticker),
-                        get_pm_book(session, token_yes, headers),
-                        get_pm_book(session, token_no, headers)
-                    )
+                pm_live = book_yes is not None and book_no is not None
+                depth = bfeed.get_depth()
+                bn_live = depth is not None
+                report_feed("Polymarket", pm_live, feed.last_error)
+                report_feed("Binance", bn_live, bfeed.last_error)
+                obi_trad_raw = binance_obi(*depth) if bn_live else None
+                err_yes = err_no = None
+
+                # REST only for the feeds that are down, fetched CONCURRENTLY.
+                rest = {}
+                if not bn_live:
+                    rest["bn"] = get_binance_obi(session, ticker)
+                if not pm_live:
+                    rest["yes"] = get_pm_book(session, token_yes, headers)
+                    rest["no"] = get_pm_book(session, token_no, headers)
+                if rest:
+                    got = dict(zip(rest, await asyncio.gather(*rest.values())))
+                    if not bn_live:
+                        obi_trad_raw = got["bn"]
+                    if not pm_live:
+                        (book_yes, err_yes), (book_no, err_no) = got["yes"], got["no"]
+
+                if obi_trad_raw is None:
+                    stall_retry_count += 1
+                    status(f"[WAITING] Binance book unavailable ({bfeed.last_error or 'connecting'}), retry #{stall_retry_count}...")
+                    await asyncio.sleep(min(5.0, 0.5 * stall_retry_count))
+                    continue
 
                 if book_yes is None or book_no is None:
                     stall_retry_count += 1
@@ -448,12 +475,13 @@ async def main():
                     if std > 0: 
                         z_score = (divergence - mean) / std
 
-                last_row = (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score, best_bid, best_ask, ask_no, bid_no, None, 'N/A', slug)
+                last_row = (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score, best_bid, best_ask, ask_no, bid_no, None, 'N/A', slug, time.time())
                 if db_cursor is not None:
                     db_cursor.execute(INSERT_SQL, last_row)
                     db_conn.commit()
 
-                status(f"Logging [{'WS' if ws_live else 'REST'}]... YES {fmt_px(best_bid)}/{fmt_px(best_ask)} | NO {fmt_px(bid_no)}/{fmt_px(ask_no)} | "
+                src = f"PM:{'WS' if pm_live else 'REST'} BN:{'WS' if bn_live else 'REST'}"
+                status(f"Logging [{src}]... YES {fmt_px(best_bid)}/{fmt_px(best_ask)} | NO {fmt_px(bid_no)}/{fmt_px(ask_no)} | "
                        f"Z-Score: {z_score:.2f} | Spread: {divergence:.4f} | T-{max(0, int(market_end_ts - time.time()))}s")
                 await asyncio.sleep(0.1)
 
