@@ -32,7 +32,7 @@ echo "updating $OLD -> $NEW"
 git_repo reset --quiet --hard "$NEW"
 
 runuser -u azureuser -- "$REPO/pm_env/bin/python" -m py_compile \
-    "$REPO/bots/bot.py" "$REPO/bots/obi_engine.py" "$REPO/bots/pm_ws.py" || rollback "syntax error"
+    "$REPO/bots/bot.py" "$REPO/bots/obi_engine.py" "$REPO/bots/pm_ws.py" "$REPO/bots/binance_ws.py" || rollback "syntax error"
 
 systemctl restart polyharvest.service
 sleep 5
