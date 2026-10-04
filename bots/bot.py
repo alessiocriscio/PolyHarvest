@@ -9,6 +9,8 @@ import json
 import re
 import sqlite3
 import datetime
+import math
+from collections import deque
 from obi_engine import calculate_obi
 from pm_ws import PMBookFeed
 from binance_ws import BinanceDepthFeed
@@ -29,6 +31,25 @@ PREFETCH_LEAD_SECONDS = 30  # look up the next slot's market this long before ex
 OBI_BAND = 0.15             # only levels within this distance from the mid
 OBI_LEVELS = 5              # top-of-book levels used for the Polymarket OBI
 
+# Signal parameters are in SECONDS, not samples, so they keep their meaning
+# whatever the sampling rate (~10/s with both WebSocket feeds, slower on REST).
+Z_MIN_COVERAGE = 0.9        # emit a Z-Score only once the window spans >= 90% of its length
+
+
+def env_seconds(name, default):
+    """Positive float from the environment (deploy/polyharvest.env), else the default."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    print(f"[SYSTEM] Ignoring invalid {name}={raw!r}, using {default}")
+    return default
+
 INTERACTIVE = sys.stdout.isatty()
 _last_status_ts = 0.0
 
@@ -48,8 +69,9 @@ def status(msg):
 
 INSERT_SQL = (
     "INSERT INTO spread_log (ticker, binance_obi_raw, binance_ema, polymarket_obi, spread, z_score, "
-    "pm_best_bid, pm_best_ask, pm_ask_no, pm_bid_no, order_id, fill_status, market_slug, ts_unix) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "pm_best_bid, pm_best_ask, pm_ask_no, pm_bid_no, order_id, fill_status, market_slug, ts_unix, "
+    "ema_tau_s, z_window_s) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
 
@@ -67,7 +89,8 @@ def init_db():
                   pm_ask_no REAL)''')
     # Migrate schema: add columns if missing (safe for existing DBs)
     for col_def in ['pm_best_bid REAL', 'pm_best_ask REAL', 'order_id TEXT', 'fill_status TEXT', 'pm_ask_no REAL', 'pm_bid_no REAL', 'market_slug TEXT',
-                    'ts_unix REAL']:  # unix seconds with sub-second precision ("timestamp" has whole seconds only)
+                    'ts_unix REAL',  # unix seconds with sub-second precision ("timestamp" has whole seconds only)
+                    'ema_tau_s REAL', 'z_window_s REAL']:  # signal parameters in force for the row
         try:
             c.execute(f'ALTER TABLE spread_log ADD COLUMN {col_def}')
         except sqlite3.OperationalError:
@@ -337,7 +360,11 @@ async def main():
                 else:
                     print(f"\n[BOOK FEED] {name}: REST fallback ({err or 'waiting for first update'})")
 
-        alpha, ema_binance, spread_history = 0.125, None, []
+        ema_tau_s = env_seconds("PM_EMA_TAU_S", 2.8)
+        z_window_s = env_seconds("PM_Z_WINDOW_S", 30.0)
+        print(f"[SYSTEM] Binance EMA time constant: {ema_tau_s}s | Z-Score window: {z_window_s}s")
+        ema_binance, ema_ts = None, None
+        spread_history = deque()  # (ts, spread) over the last z_window_s seconds
         last_row = None  # last tick logged for the current market
         next_market = None  # next slot's market, pre-fetched before expiry
         next_prefetch_ts = 0
@@ -372,7 +399,7 @@ async def main():
                         market_end_ts = slot_start + SLOT_SECONDS
                         rotation_retry_count = 0
                         stall_retry_count = 0
-                        spread_history = []
+                        spread_history.clear()
                         await feed.track([token_yes, token_no])
                         print(f"\n[PROACTIVE ROTATION] Switched to next active slot: {question} ({slug})")
                         await asyncio.sleep(0.1)
@@ -458,24 +485,34 @@ async def main():
 
                 obi_pm = calculate_obi(pd.DataFrame({"bid_size": [v_b_pm], "ask_size": [v_a_pm]})) if (v_b_pm + v_a_pm) > 0 else 0
 
-                ema_binance = obi_trad_raw if ema_binance is None else (obi_trad_raw * alpha) + (ema_binance * (1 - alpha))
+                tick_ts = time.time()
+
+                # Continuous-time EMA: alpha follows the real gap between samples,
+                # so the smoothing horizon is ema_tau_s seconds at any sampling rate.
+                if ema_binance is None:
+                    ema_binance = obi_trad_raw
+                else:
+                    alpha = 1 - math.exp(-(tick_ts - ema_ts) / ema_tau_s)
+                    ema_binance = (obi_trad_raw * alpha) + (ema_binance * (1 - alpha))
+                ema_ts = tick_ts
 
                 # DIRECTIONAL SPREAD: No abs() to maintain signal direction
                 divergence = ema_binance - obi_pm
-                
-                # ROLLING WINDOW: 80 samples
-                spread_history.append(divergence)
-                if len(spread_history) > 80: 
-                    spread_history.pop(0)
+
+                # ROLLING WINDOW: every sample of the last z_window_s seconds
+                spread_history.append((tick_ts, divergence))
+                while tick_ts - spread_history[0][0] > z_window_s:
+                    spread_history.popleft()
 
                 z_score = 0
-                if len(spread_history) == 80:
-                    s_series = pd.Series(spread_history)
+                if (len(spread_history) >= 2
+                        and tick_ts - spread_history[0][0] >= Z_MIN_COVERAGE * z_window_s):
+                    s_series = pd.Series([d for _, d in spread_history])
                     mean, std = s_series.mean(), s_series.std()
-                    if std > 0: 
+                    if std > 0:
                         z_score = (divergence - mean) / std
 
-                last_row = (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score, best_bid, best_ask, ask_no, bid_no, None, 'N/A', slug, time.time())
+                last_row = (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score, best_bid, best_ask, ask_no, bid_no, None, 'N/A', slug, tick_ts, ema_tau_s, z_window_s)
                 if db_cursor is not None:
                     db_cursor.execute(INSERT_SQL, last_row)
                     db_conn.commit()
