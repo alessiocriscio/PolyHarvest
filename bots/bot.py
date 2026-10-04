@@ -285,7 +285,9 @@ async def main():
         db_cursor = None
         print("[SYSTEM] Data logging disabled for this session.")
 
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    # Identify honestly: Polymarket's Cloudflare WAF intermittently blocks (HTTP 403)
+    # non-browser clients that present a browser User-Agent.
+    headers = {'User-Agent': 'PolyHarvest/1.0 (+https://github.com/alessiocriscio/PolyHarvest)'}
 
     asset_choice = os.environ.get("PM_ASSET")
     if asset_choice is None:
@@ -373,7 +375,7 @@ async def main():
                 if book_yes is None or book_no is None:
                     stall_retry_count += 1
                     status(f"[WAITING] Polymarket book unavailable ({err_yes or err_no}), retry #{stall_retry_count}...")
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(min(5.0, 0.5 * stall_retry_count))
                     continue
 
                 bids_yes, asks_yes = parse_book(book_yes)
