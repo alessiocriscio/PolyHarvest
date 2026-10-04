@@ -1,0 +1,15 @@
+[Unit]
+Description=PolyHarvest telemetry bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=azureuser
+WorkingDirectory=/home/azureuser/bot_pm/bots
+EnvironmentFile=/home/azureuser/bot_pm/deploy/polyharvest.env
+ExecStart=/home/azureuser/bot_pm/pm_env/bin/python bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
