@@ -86,7 +86,7 @@ def binance_obi(bids, asks):
 
 async def get_binance_obi(session, symbol):
     """REST fallback for the depth stream. Returns None on failure, never a fake 0."""
-    # USDM perp futures: più volume, lead spot, più istituzionale
+    # USD-M perpetual futures: more volume than spot, tends to lead it, more institutional flow
     url = f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit=5"
     try:
         async with session.get(url, timeout=3) as resp:

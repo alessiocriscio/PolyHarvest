@@ -1,27 +1,27 @@
-# Deploy sul server
+# Server deployment
 
-Il bot gira sulla VM come servizio systemd `polyharvest` (utente `azureuser`, repo in `~/bot_pm`).
-Ogni 2 minuti `polyharvest-update.timer` esegue `update.sh`: se `main` su GitHub è cambiato,
-scarica il nuovo codice e riavvia il bot. Se il codice non compila o il bot non resta attivo,
-viene ripristinato il commit precedente e quello difettoso non viene più ritentato.
+The bot runs on the VM as the systemd service `polyharvest` (user `azureuser`, repo in `~/bot_pm`).
+Every 2 minutes `polyharvest-update.timer` runs `update.sh`: if `main` on GitHub has changed,
+it pulls the new code and restarts the bot. If the code does not compile or the bot does not
+stay up, the previous commit is restored and the broken one is never retried.
 
-- Cambiare asset o disattivare il logging: modificare `polyharvest.env`, commit e push su `main`.
-- `market_data.db` e `pm_env/` restano solo sul server (sono in `.gitignore`).
-- Se si modificano i file `.service` / `.timer`, vanno ricopiati a mano in `/etc/systemd/system/`
-  e va eseguito `sudo systemctl daemon-reload`.
+- To change asset or disable logging: edit `polyharvest.env`, commit and push to `main`.
+- `market_data.db` and `pm_env/` live only on the server (they are in `.gitignore`).
+- After changing the `.service` / `.timer` files, copy them by hand to `/etc/systemd/system/`
+  and run `sudo systemctl daemon-reload`.
 
-I book arrivano in diretta via WebSocket: Polymarket dal CLOB (`bots/pm_ws.py`), Binance dallo
-stream `depth5@100ms` dei futures (`bots/binance_ws.py`). Finché un socket è giù o non ha ancora
-mandato dati, il bot legge quel book via REST. Il journal registra ogni passaggio con una riga
-`[BOOK FEED] <fonte>: WebSocket live` / `[BOOK FEED] <fonte>: REST fallback (...)`.
+Order books are streamed live over WebSocket: Polymarket from the CLOB (`bots/pm_ws.py`), Binance
+from the futures `depth5@100ms` stream (`bots/binance_ws.py`). While a socket is down or has not
+sent data yet, the bot reads that book over REST. The journal records every switch with a line
+`[BOOK FEED] <source>: WebSocket live` / `[BOOK FEED] <source>: REST fallback (...)`.
 
-Il database è `bots/market_data.db`. Per azzerarlo: fermare il bot, cancellare il file, riavviare.
+The database is `bots/market_data.db`. To reset it: stop the bot, delete the file, restart.
 
-Comandi utili sul server:
+Useful commands on the server:
 
 ```bash
-systemctl status polyharvest                      # stato del bot
-journalctl -u polyharvest -n 30 -o cat            # ultime righe del bot
-journalctl -u polyharvest-update -n 20 -o cat     # storico degli aggiornamenti
-sudo systemctl restart polyharvest                # riavvio manuale
+systemctl status polyharvest                      # bot status
+journalctl -u polyharvest -n 30 -o cat            # latest bot output
+journalctl -u polyharvest-update -n 20 -o cat     # update history
+sudo systemctl restart polyharvest                # manual restart
 ```

@@ -7,7 +7,7 @@ try:
     # 1. Loading dataset
     df = pd.read_csv('logged_data/BTC_5m_clean.csv')
     
-    # 2. Pulizia e formattazione dei dati
+    # 2. Data cleaning and formatting
     df['z_score'] = pd.to_numeric(df['z_score'], errors='coerce')
     df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
     df = df.dropna(subset=['z_score', 'timestamp'])
@@ -44,12 +44,12 @@ try:
         med_dur = np.median(trade_durations)
         max_dur = np.max(trade_durations)
         
-        print(f"Operazioni Chiuse: {num_trades}")
-        print(f"Media (secondi): {avg_dur:.2f}")
-        print(f"Mediana (secondi): {med_dur:.2f}")
-        print(f"Max Drawdown Temporale (secondi): {max_dur:.2f}")
+        print(f"Closed trades: {num_trades}")
+        print(f"Mean (seconds): {avg_dur:.2f}")
+        print(f"Median (seconds): {med_dur:.2f}")
+        print(f"Max time drawdown (seconds): {max_dur:.2f}")
     else:
-        print("Nessun trade elaborato.")
+        print("No trades processed.")
 
 except Exception as e:
-    print(f"Errore durante l'esecuzione: {e}")
+    print(f"Error during execution: {e}")
