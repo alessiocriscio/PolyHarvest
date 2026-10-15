@@ -74,6 +74,7 @@ class PMBookFeed:
         return {
             "bids": [{"price": p, "size": s} for p, s in book["bids"].items()],
             "asks": [{"price": p, "size": s} for p, s in book["asks"].items()],
+            "timestamp": book.get("ts"),   # exchange time (ms) of the last update
         }
 
     async def _run(self):
@@ -142,13 +143,17 @@ class PMBookFeed:
         token = str(ev.get("asset_id"))
         if token not in self.wanted:
             return
-        self.books[token] = {"bids": _levels(ev.get("bids")), "asks": _levels(ev.get("asks"))}
+        self.books[token] = {"bids": _levels(ev.get("bids")), "asks": _levels(ev.get("asks")),
+                             "ts": _ms(ev.get("timestamp"))}
 
     def _on_price_change(self, ev):
+        ts = _ms(ev.get("timestamp"))
         for ch in ev.get("price_changes") or []:
             book = self.books.get(str(ch.get("asset_id")))
             if book is None:
                 continue  # no snapshot yet: a partial update alone is not a book
+            if ts is not None:
+                book["ts"] = ts
             side = {"BUY": "bids", "SELL": "asks"}.get(ch.get("side"))
             try:
                 price, size = float(ch["price"]), float(ch["size"])
@@ -160,6 +165,13 @@ class PMBookFeed:
                 book[side][price] = size
             else:
                 book[side].pop(price, None)
+
+
+def _ms(raw):
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _levels(raw):

@@ -25,6 +25,7 @@ class BinanceDepthFeed:
         self.url = f"{WS_BASE}/{symbol.lower()}@depth5@100ms"
         self.bids = None        # [[price, qty], ...] as sent, best first
         self.asks = None
+        self.event_ms = None    # Binance event time "E" of the latest push (ms)
         self.last_msg_ts = 0.0
         self.connected = False
         self.last_error = None
@@ -87,5 +88,6 @@ class BinanceDepthFeed:
         if not isinstance(bids, list) or not isinstance(asks, list):
             return False
         self.bids, self.asks = bids, asks
+        self.event_ms = ev.get("E")
         self.last_msg_ts = time.time()
         return True
