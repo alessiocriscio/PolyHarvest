@@ -16,6 +16,13 @@ sent data yet, the bot reads that book over REST. The journal records every swit
 `[BOOK FEED] <source>: WebSocket live` / `[BOOK FEED] <source>: REST fallback (...)`.
 
 The database is `bots/market_data.db`. To reset it: stop the bot, delete the file, restart.
+It has two tables:
+
+- `spread_log`: one row per tick (~10/s). Besides books and signals it stores the BTC top of book
+  with Binance's event time (`btc_bid`, `btc_ask`, `btc_event_ms`), the exchange time of each
+  Polymarket book (`pm_yes_ts_ms`, `pm_no_ts_ms`), top-of-book sizes and the market's price to beat.
+- `markets`: one row per market with Polymarket's official `price_to_beat` and `final_price`
+  (Chainlink BTC/USD 60 s TWAP, from the Gamma event's `eventMetadata`) and when each was first seen.
 
 Useful commands on the server:
 

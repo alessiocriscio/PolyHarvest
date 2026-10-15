@@ -70,9 +70,14 @@ def status(msg):
 INSERT_SQL = (
     "INSERT INTO spread_log (ticker, binance_obi_raw, binance_ema, polymarket_obi, spread, z_score, "
     "pm_best_bid, pm_best_ask, pm_ask_no, pm_bid_no, order_id, fill_status, market_slug, ts_unix, "
-    "ema_tau_s, z_window_s) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "ema_tau_s, z_window_s, "
+    "btc_bid, btc_ask, btc_event_ms, pm_yes_ts_ms, pm_no_ts_ms, "
+    "pm_bid_size, pm_ask_size, pm_bid_size_no, pm_ask_size_no, price_to_beat) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
+
+META_POLL_SECONDS = 2       # how often Gamma is asked for price to beat / final price
+FINAL_GIVE_UP_SECONDS = 1800  # stop waiting for a final price this long after expiry
 
 
 def init_db():
@@ -90,11 +95,27 @@ def init_db():
     # Migrate schema: add columns if missing (safe for existing DBs)
     for col_def in ['pm_best_bid REAL', 'pm_best_ask REAL', 'order_id TEXT', 'fill_status TEXT', 'pm_ask_no REAL', 'pm_bid_no REAL', 'market_slug TEXT',
                     'ts_unix REAL',  # unix seconds with sub-second precision ("timestamp" has whole seconds only)
-                    'ema_tau_s REAL', 'z_window_s REAL']:  # signal parameters in force for the row
+                    'ema_tau_s REAL', 'z_window_s REAL',  # signal parameters in force for the row
+                    # inputs for the fair value of YES: BTC top of book with Binance's event
+                    # time, exchange time of each Polymarket book, top-of-book sizes, and
+                    # the market's price to beat (NULL until Polymarket publishes it)
+                    'btc_bid REAL', 'btc_ask REAL', 'btc_event_ms INTEGER',
+                    'pm_yes_ts_ms INTEGER', 'pm_no_ts_ms INTEGER',
+                    'pm_bid_size REAL', 'pm_ask_size REAL', 'pm_bid_size_no REAL', 'pm_ask_size_no REAL',
+                    'price_to_beat REAL']:
         try:
             c.execute(f'ALTER TABLE spread_log ADD COLUMN {col_def}')
         except sqlite3.OperationalError:
             pass  # column already exists
+    # One row per market: Polymarket's official price to beat and final price
+    # (Chainlink BTC/USD 60 s TWAP), with the time each was first seen.
+    c.execute('''CREATE TABLE IF NOT EXISTS markets
+                 (market_slug TEXT PRIMARY KEY,
+                  slot_start INTEGER,
+                  price_to_beat REAL,
+                  ptb_seen_ts REAL,
+                  final_price REAL,
+                  final_seen_ts REAL)''')
     conn.commit()
     return conn
 
@@ -107,15 +128,17 @@ def binance_obi(bids, asks):
     return calculate_obi(df) if (vol_bids + vol_asks) > 0 else 0
 
 
-async def get_binance_obi(session, symbol):
-    """REST fallback for the depth stream. Returns None on failure, never a fake 0."""
+async def get_binance_depth(session, symbol):
+    """REST fallback for the depth stream: (bids, asks, event_ms), or None on failure."""
     # USD-M perpetual futures: more volume than spot, tends to lead it, more institutional flow
     url = f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit=5"
     try:
         async with session.get(url, timeout=3) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                return binance_obi(data.get('bids', []), data.get('asks', []))
+                bids, asks = data.get('bids') or [], data.get('asks') or []
+                if bids and asks:
+                    return bids, asks, data.get('E')
     except Exception:
         pass
     return None
@@ -180,6 +203,102 @@ async def get_market_volume(session, slug, headers):
 
 
 
+
+
+def _int_or_none(raw):
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _num(raw):
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+async def fetch_event_metadata(session, slug, headers):
+    """
+    (price_to_beat, final_price) from the Gamma event's eventMetadata, each None
+    until Polymarket publishes it; None altogether if the request fails.
+    """
+    url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+    try:
+        async with session.get(url, headers=headers, timeout=5) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+    except Exception:
+        return None
+    ev = data[0] if isinstance(data, list) and data else data if isinstance(data, dict) else {}
+    meta = ev.get("eventMetadata") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except ValueError:
+            meta = {}
+    return _num(meta.get("priceToBeat")), _num(meta.get("finalPrice"))
+
+
+class MarketMeta:
+    """
+    Polls Gamma in the background for each tracked market's price to beat (from
+    shortly before it opens) and final price (after it closes), and stores them
+    in the `markets` table with the time each was first seen.
+    """
+
+    def __init__(self, session, headers, db_conn):
+        self.session, self.headers, self.db = session, headers, db_conn
+        self.pending = {}   # slug -> {"slot", "ptb", "final"}
+        self.ptb = {}       # slug -> price to beat, kept for the status line and rows
+        self.added = set()
+
+    def add(self, slug, slot_start):
+        if slug in self.added:
+            return
+        self.added.add(slug)
+        self.pending[slug] = {"slot": slot_start, "ptb": None, "final": None}
+        if self.db is not None:
+            self.db.execute("INSERT OR IGNORE INTO markets (market_slug, slot_start) VALUES (?, ?)",
+                            (slug, slot_start))
+            self.db.commit()
+
+    def price_to_beat(self, slug):
+        return self.ptb.get(slug)
+
+    def _save(self, slug, column, value, seen_column, seen_ts):
+        if self.db is not None:
+            self.db.execute(f"UPDATE markets SET {column} = ?, {seen_column} = ? WHERE market_slug = ?",
+                            (value, seen_ts, slug))
+            self.db.commit()
+
+    async def run(self):
+        while True:
+            now = time.time()
+            for slug, m in list(self.pending.items()):
+                want_ptb = m["ptb"] is None and now >= m["slot"] - PREFETCH_LEAD_SECONDS
+                want_final = m["final"] is None and now >= m["slot"] + SLOT_SECONDS
+                if not (want_ptb or want_final):
+                    continue
+                got = await fetch_event_metadata(self.session, slug, self.headers)
+                if got is not None:
+                    ptb, final = got
+                    seen = time.time()
+                    if want_ptb and ptb is not None:
+                        m["ptb"] = self.ptb[slug] = ptb
+                        self._save(slug, "price_to_beat", ptb, "ptb_seen_ts", seen)
+                    if want_final and final is not None:
+                        m["final"] = final
+                        self._save(slug, "final_price", final, "final_seen_ts", seen)
+                done = m["final"] is not None and m["ptb"] is not None
+                if done or now > m["slot"] + SLOT_SECONDS + FINAL_GIVE_UP_SECONDS:
+                    del self.pending[slug]
+            # forget prices to beat of markets that are done
+            if len(self.ptb) > 20:
+                self.ptb = {k: v for k, v in self.ptb.items() if k in self.pending}
+            await asyncio.sleep(META_POLL_SECONDS)
 
 
 async def get_pm_book(session, token_id, headers):
@@ -350,6 +469,10 @@ async def main():
         # Same for Binance: depth5@100ms stream, REST /depth only as fallback.
         bfeed = BinanceDepthFeed(session, ticker)
         bfeed.start()
+        # Official price to beat / final price of each market, polled in the background.
+        meta = MarketMeta(session, headers, db_conn)
+        meta.add(slug, slot_start)
+        meta_task = asyncio.create_task(meta.run())
         feed_live = {"Polymarket": False, "Binance": False}
 
         def report_feed(name, live, err):
@@ -401,6 +524,7 @@ async def main():
                         stall_retry_count = 0
                         spread_history.clear()
                         await feed.track([token_yes, token_no])
+                        meta.add(slug, slot_start)
                         print(f"\n[PROACTIVE ROTATION] Switched to next active slot: {question} ({slug})")
                         await asyncio.sleep(0.1)
                         continue
@@ -419,6 +543,7 @@ async def main():
                     if next_market is not None:
                         # subscribe early so the next market's books are live at the switch
                         await feed.track([token_yes, token_no, next_market[2], next_market[3]])
+                        meta.add(next_market[4], next_market[0])
 
                 # Both books normally come from memory (WebSocket feeds): no network wait.
                 book_yes, book_no = feed.get_book(token_yes), feed.get_book(token_no)
@@ -427,24 +552,25 @@ async def main():
                 bn_live = depth is not None
                 report_feed("Polymarket", pm_live, feed.last_error)
                 report_feed("Binance", bn_live, bfeed.last_error)
-                obi_trad_raw = binance_obi(*depth) if bn_live else None
+                if bn_live:
+                    depth = (*depth, bfeed.event_ms)
                 err_yes = err_no = None
 
                 # REST only for the feeds that are down, fetched CONCURRENTLY.
                 rest = {}
                 if not bn_live:
-                    rest["bn"] = get_binance_obi(session, ticker)
+                    rest["bn"] = get_binance_depth(session, ticker)
                 if not pm_live:
                     rest["yes"] = get_pm_book(session, token_yes, headers)
                     rest["no"] = get_pm_book(session, token_no, headers)
                 if rest:
                     got = dict(zip(rest, await asyncio.gather(*rest.values())))
                     if not bn_live:
-                        obi_trad_raw = got["bn"]
+                        depth = got["bn"]
                     if not pm_live:
                         (book_yes, err_yes), (book_no, err_no) = got["yes"], got["no"]
 
-                if obi_trad_raw is None:
+                if depth is None or not depth[0] or not depth[1]:
                     stall_retry_count += 1
                     status(f"[WAITING] Binance book unavailable ({bfeed.last_error or 'connecting'}), retry #{stall_retry_count}...")
                     await asyncio.sleep(min(5.0, 0.5 * stall_retry_count))
@@ -466,11 +592,18 @@ async def main():
                     continue
                 stall_retry_count = 0
 
+                bn_bids, bn_asks, btc_event_ms = depth
+                obi_trad_raw = binance_obi(bn_bids, bn_asks)
+                btc_bid, btc_ask = float(bn_bids[0][0]), float(bn_asks[0][0])
+
                 # REAL top of book straight from the CLOB (None = that side is empty)
                 best_bid = bids_yes[0][0] if bids_yes else None
                 best_ask = asks_yes[0][0] if asks_yes else None
                 bid_no   = bids_no[0][0] if bids_no else None
                 ask_no   = asks_no[0][0] if asks_no else None
+                top_sizes = (bids_yes[0][1] if bids_yes else None, asks_yes[0][1] if asks_yes else None,
+                             bids_no[0][1] if bids_no else None, asks_no[0][1] if asks_no else None)
+                price_to_beat = meta.price_to_beat(slug)
 
                 if best_bid is not None and best_ask is not None:
                     mid_yes = (best_bid + best_ask) / 2
@@ -512,14 +645,20 @@ async def main():
                     if std > 0:
                         z_score = (divergence - mean) / std
 
-                last_row = (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score, best_bid, best_ask, ask_no, bid_no, None, 'N/A', slug, tick_ts, ema_tau_s, z_window_s)
+                last_row = (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score, best_bid, best_ask, ask_no, bid_no, None, 'N/A', slug, tick_ts, ema_tau_s, z_window_s,
+                            btc_bid, btc_ask, btc_event_ms,
+                            _int_or_none(book_yes.get("timestamp")), _int_or_none(book_no.get("timestamp")),
+                            *top_sizes, price_to_beat)
                 if db_cursor is not None:
                     db_cursor.execute(INSERT_SQL, last_row)
                     db_conn.commit()
 
                 src = f"PM:{'WS' if pm_live else 'REST'} BN:{'WS' if bn_live else 'REST'}"
+                btc_mid = (btc_bid + btc_ask) / 2
+                vs_k = (f"K {price_to_beat:,.2f} ({100 * (btc_mid / price_to_beat - 1):+.3f}%)"
+                        if price_to_beat else "K pending")
                 status(f"Logging [{src}]... YES {fmt_px(best_bid)}/{fmt_px(best_ask)} | NO {fmt_px(bid_no)}/{fmt_px(ask_no)} | "
-                       f"Z-Score: {z_score:.2f} | Spread: {divergence:.4f} | T-{max(0, int(market_end_ts - time.time()))}s")
+                       f"BTC {btc_mid:,.1f} vs {vs_k} | Z {z_score:.2f} | T-{max(0, int(market_end_ts - time.time()))}s")
                 await asyncio.sleep(0.1)
 
             except KeyboardInterrupt:
