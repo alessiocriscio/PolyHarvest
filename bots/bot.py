@@ -4,6 +4,7 @@ import time
 import socket
 import aiohttp
 import asyncio
+import numpy as np
 import pandas as pd
 import json
 import re
@@ -72,12 +73,19 @@ INSERT_SQL = (
     "pm_best_bid, pm_best_ask, pm_ask_no, pm_bid_no, order_id, fill_status, market_slug, ts_unix, "
     "ema_tau_s, z_window_s, "
     "btc_bid, btc_ask, btc_event_ms, pm_yes_ts_ms, pm_no_ts_ms, "
-    "pm_bid_size, pm_ask_size, pm_bid_size_no, pm_ask_size_no, price_to_beat) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "pm_bid_size, pm_ask_size, pm_bid_size_no, pm_ask_size_no, ptb_est, ptb_basis) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
-META_POLL_SECONDS = 2       # how often Gamma is asked for price to beat / final price
+# Polymarket publishes a market's price to beat only after the market closes, and its
+# final price ~6-7 min later. The price to beat IS the Chainlink BTC/USD 60 s TWAP at
+# the market's start (= previous market's final price), so live it is estimated as the
+# Binance 60 s TWAP at the start plus the recent Chainlink - Binance basis.
+META_POLL_SECONDS = 10      # how often Gamma is asked, from the market's close
 FINAL_GIVE_UP_SECONDS = 1800  # stop waiting for a final price this long after expiry
+TWAP_SECONDS = 60           # settlement TWAP length (resolution source: btc-usd-twap-60s)
+BASIS_MARKETS = 12          # basis = median over the last 12 markets (1 hour)
+BTC_HISTORY_SECONDS = 150   # BTC mid history kept for the TWAP
 
 
 def init_db():
@@ -97,12 +105,12 @@ def init_db():
                     'ts_unix REAL',  # unix seconds with sub-second precision ("timestamp" has whole seconds only)
                     'ema_tau_s REAL', 'z_window_s REAL',  # signal parameters in force for the row
                     # inputs for the fair value of YES: BTC top of book with Binance's event
-                    # time, exchange time of each Polymarket book, top-of-book sizes, and
-                    # the market's price to beat (NULL until Polymarket publishes it)
+                    # time, exchange time of each Polymarket book, top-of-book sizes
                     'btc_bid REAL', 'btc_ask REAL', 'btc_event_ms INTEGER',
                     'pm_yes_ts_ms INTEGER', 'pm_no_ts_ms INTEGER',
                     'pm_bid_size REAL', 'pm_ask_size REAL', 'pm_bid_size_no REAL', 'pm_ask_size_no REAL',
-                    'price_to_beat REAL']:
+                    'price_to_beat REAL',  # unused: the official value only exists after close (see markets)
+                    'ptb_est REAL', 'ptb_basis REAL']:  # live estimate of the price to beat, basis it used
         try:
             c.execute(f'ALTER TABLE spread_log ADD COLUMN {col_def}')
         except sqlite3.OperationalError:
@@ -116,6 +124,10 @@ def init_db():
                   ptb_seen_ts REAL,
                   final_price REAL,
                   final_seen_ts REAL)''')
+    try:  # Binance mid 60 s TWAP at the market's start, to measure the Chainlink basis
+        c.execute('ALTER TABLE markets ADD COLUMN binance_twap_start REAL')
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     return conn
 
@@ -242,18 +254,43 @@ async def fetch_event_metadata(session, slug, headers):
     return _num(meta.get("priceToBeat")), _num(meta.get("finalPrice"))
 
 
+def time_weighted_mean(samples, a, b, max_gap=5.0):
+    """
+    Mean over [a, b] of the step function through (t, value) samples sorted by t.
+    None if there is no sample within max_gap before a, or a hole longer than max_gap.
+    """
+    before = [(t, v) for t, v in samples if t <= a]
+    if not before or a - before[-1][0] > max_gap:
+        return None
+    seq = [(a, before[-1][1])] + [(t, v) for t, v in samples if a < t < b] + [(b, None)]
+    total = 0.0
+    for (t0, v0), (t1, _) in zip(seq, seq[1:]):
+        if t1 - t0 > max_gap:
+            return None
+        total += v0 * (t1 - t0)
+    return total / (b - a)
+
+
 class MarketMeta:
     """
-    Polls Gamma in the background for each tracked market's price to beat (from
-    shortly before it opens) and final price (after it closes), and stores them
-    in the `markets` table with the time each was first seen.
+    Polls Gamma in the background, from each tracked market's close, for its
+    official price to beat and final price, and stores them in the `markets`
+    table with the time each was first seen. Also keeps the Binance 60 s TWAP at
+    each market's start, so that the Chainlink - Binance basis can be measured
+    and the live price to beat estimated.
     """
 
     def __init__(self, session, headers, db_conn):
         self.session, self.headers, self.db = session, headers, db_conn
         self.pending = {}   # slug -> {"slot", "ptb", "final"}
-        self.ptb = {}       # slug -> price to beat, kept for the status line and rows
         self.added = set()
+        self.binance_twap = {}   # slug -> Binance mid 60 s TWAP at the market's start
+        self.basis = deque(maxlen=BASIS_MARKETS)   # official price to beat - Binance TWAP
+        if db_conn is not None:
+            rows = db_conn.execute(
+                "SELECT price_to_beat - binance_twap_start FROM markets WHERE price_to_beat IS NOT NULL "
+                "AND binance_twap_start IS NOT NULL ORDER BY slot_start DESC LIMIT ?", (BASIS_MARKETS,)).fetchall()
+            self.basis.extend(r[0] for r in reversed(rows))
 
     def add(self, slug, slot_start):
         if slug in self.added:
@@ -265,8 +302,19 @@ class MarketMeta:
                             (slug, slot_start))
             self.db.commit()
 
-    def price_to_beat(self, slug):
-        return self.ptb.get(slug)
+    def set_binance_twap(self, slug, value):
+        self.binance_twap[slug] = value
+        if self.db is not None:
+            self.db.execute("UPDATE markets SET binance_twap_start = ? WHERE market_slug = ?", (value, slug))
+            self.db.commit()
+
+    def ptb_estimate(self, slug):
+        """(estimated price to beat, basis used); basis None while no market has been measured."""
+        twap = self.binance_twap.get(slug)
+        if twap is None:
+            return None, None
+        basis = float(np.median(self.basis)) if self.basis else None
+        return twap + (basis or 0.0), basis
 
     def _save(self, slug, column, value, seen_column, seen_ts):
         if self.db is not None:
@@ -278,26 +326,25 @@ class MarketMeta:
         while True:
             now = time.time()
             for slug, m in list(self.pending.items()):
-                want_ptb = m["ptb"] is None and now >= m["slot"] - PREFETCH_LEAD_SECONDS
-                want_final = m["final"] is None and now >= m["slot"] + SLOT_SECONDS
-                if not (want_ptb or want_final):
-                    continue
+                if now < m["slot"] + SLOT_SECONDS:
+                    continue  # nothing is published before the market closes
+                want_ptb, want_final = m["ptb"] is None, m["final"] is None
                 got = await fetch_event_metadata(self.session, slug, self.headers)
                 if got is not None:
                     ptb, final = got
                     seen = time.time()
                     if want_ptb and ptb is not None:
-                        m["ptb"] = self.ptb[slug] = ptb
+                        m["ptb"] = ptb
                         self._save(slug, "price_to_beat", ptb, "ptb_seen_ts", seen)
+                        if self.binance_twap.get(slug) is not None:
+                            self.basis.append(ptb - self.binance_twap[slug])
                     if want_final and final is not None:
                         m["final"] = final
                         self._save(slug, "final_price", final, "final_seen_ts", seen)
                 done = m["final"] is not None and m["ptb"] is not None
                 if done or now > m["slot"] + SLOT_SECONDS + FINAL_GIVE_UP_SECONDS:
                     del self.pending[slug]
-            # forget prices to beat of markets that are done
-            if len(self.ptb) > 20:
-                self.ptb = {k: v for k, v in self.ptb.items() if k in self.pending}
+                    self.binance_twap.pop(slug, None)
             await asyncio.sleep(META_POLL_SECONDS)
 
 
@@ -473,6 +520,7 @@ async def main():
         meta = MarketMeta(session, headers, db_conn)
         meta.add(slug, slot_start)
         meta_task = asyncio.create_task(meta.run())
+        btc_hist = deque()  # (Binance event time in s, BTC mid) for the start-of-market TWAP
         feed_live = {"Polymarket": False, "Binance": False}
 
         def report_feed(name, live, err):
@@ -595,6 +643,16 @@ async def main():
                 bn_bids, bn_asks, btc_event_ms = depth
                 obi_trad_raw = binance_obi(bn_bids, bn_asks)
                 btc_bid, btc_ask = float(bn_bids[0][0]), float(bn_asks[0][0])
+                btc_mid = (btc_bid + btc_ask) / 2
+                t_btc = btc_event_ms / 1000 if btc_event_ms else time.time()
+                if not btc_hist or t_btc > btc_hist[-1][0]:
+                    btc_hist.append((t_btc, btc_mid))
+                while t_btc - btc_hist[0][0] > BTC_HISTORY_SECONDS:
+                    btc_hist.popleft()
+                # Binance 60 s TWAP ending at this market's start, once that window is over
+                if slug not in meta.binance_twap and t_btc >= slot_start + 1:
+                    meta.set_binance_twap(slug, time_weighted_mean(btc_hist, slot_start - TWAP_SECONDS, slot_start))
+                ptb_est, ptb_basis = meta.ptb_estimate(slug)
 
                 # REAL top of book straight from the CLOB (None = that side is empty)
                 best_bid = bids_yes[0][0] if bids_yes else None
@@ -603,7 +661,6 @@ async def main():
                 ask_no   = asks_no[0][0] if asks_no else None
                 top_sizes = (bids_yes[0][1] if bids_yes else None, asks_yes[0][1] if asks_yes else None,
                              bids_no[0][1] if bids_no else None, asks_no[0][1] if asks_no else None)
-                price_to_beat = meta.price_to_beat(slug)
 
                 if best_bid is not None and best_ask is not None:
                     mid_yes = (best_bid + best_ask) / 2
@@ -648,15 +705,14 @@ async def main():
                 last_row = (ticker, obi_trad_raw, ema_binance, obi_pm, divergence, z_score, best_bid, best_ask, ask_no, bid_no, None, 'N/A', slug, tick_ts, ema_tau_s, z_window_s,
                             btc_bid, btc_ask, btc_event_ms,
                             _int_or_none(book_yes.get("timestamp")), _int_or_none(book_no.get("timestamp")),
-                            *top_sizes, price_to_beat)
+                            *top_sizes, ptb_est, ptb_basis)
                 if db_cursor is not None:
                     db_cursor.execute(INSERT_SQL, last_row)
                     db_conn.commit()
 
                 src = f"PM:{'WS' if pm_live else 'REST'} BN:{'WS' if bn_live else 'REST'}"
-                btc_mid = (btc_bid + btc_ask) / 2
-                vs_k = (f"K {price_to_beat:,.2f} ({100 * (btc_mid / price_to_beat - 1):+.3f}%)"
-                        if price_to_beat else "K pending")
+                vs_k = (f"K~{ptb_est:,.2f}{'' if ptb_basis is not None else ' (no basis yet)'} "
+                        f"({100 * (btc_mid / ptb_est - 1):+.3f}%)" if ptb_est else "K n/a")
                 status(f"Logging [{src}]... YES {fmt_px(best_bid)}/{fmt_px(best_ask)} | NO {fmt_px(bid_no)}/{fmt_px(ask_no)} | "
                        f"BTC {btc_mid:,.1f} vs {vs_k} | Z {z_score:.2f} | T-{max(0, int(market_end_ts - time.time()))}s")
                 await asyncio.sleep(0.1)
